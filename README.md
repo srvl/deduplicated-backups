@@ -19,14 +19,14 @@ bash <(curl -sL https://github.com/srvl/deduplicated-backups/raw/main/install-wi
 
 ## Method 2: Manual Installation
 
-1. Upload or copy the "wings" binary and "install.sh" to your VPS
+1. Upload or copy the "wings" binary and "install-wings.sh" to your VPS
 2. Make the installer executable:
 
-chmod +x install.sh
+chmod +x install-wings.sh
 
 3. Run the installer:
 
-./install.sh
+./install-wings.sh
 
 4. Follow the interactive setup.
 
