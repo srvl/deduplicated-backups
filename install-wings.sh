@@ -127,17 +127,19 @@ install_wings_dedup() {
     if [ ! -f "./wings" ]; then
         echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup...${NC}"
         
-        # Download the binary (Replace 'main' with your specific release tag if needed)
-        curl -L -o wings https://github.com/srvl/wings-dedup-releases/raw/main/wings
+        # CORRECT URL for GitHub Release Assets
+        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/Release/wings"
         
-        # Verify download succeeded
-        if [ ! -f "./wings" ]; then
+        # Download with -f (fail on error) and -L (follow redirects)
+        if curl -f -L -o wings "$DOWNLOAD_URL"; then
+            echo -e "  ${GREEN}✓${NC} Download complete"
+            chmod +x wings
+        else
             echo -e "  ${RED}✗ Failed to download wings binary!${NC}"
+            echo -e "  ${YELLOW}  Debug: URL was $DOWNLOAD_URL${NC}"
+            echo -e "  ${YELLOW}  Possible causes: Repository is Private (requires token) or file name mismatch.${NC}"
             exit 1
         fi
-        
-        chmod +x wings
-        echo -e "  ${GREEN}✓${NC} Download complete"
     fi
     
     # Check binary compatibility
