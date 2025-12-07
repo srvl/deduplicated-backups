@@ -97,25 +97,35 @@ install_wings_dedup() {
     echo -e "${BLUE}${BOLD}[Step 1/5] Pre-flight checks...${NC}"
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64|amd64) EXPECTED_ARCH="x86-64";;
-        aarch64|arm64) EXPECTED_ARCH="aarch64";;
-        *) echo -e "  ${RED}✗ Unsupported architecture: ${ARCH}${NC}"; exit 1;;
+        x86_64|amd64)
+            ARCH_NAME="amd64"
+            BINARY_NAME="wings_amd"
+            ;;
+        aarch64|arm64)
+            ARCH_NAME="arm64"
+            BINARY_NAME="wings_arm"
+            ;;
+        *)
+            echo -e "  ${RED}✗ Unsupported architecture: ${ARCH}${NC}"
+            exit 1
+            ;;
     esac
-    echo -e "  ${GREEN}✓${NC} Architecture: ${CYAN}${ARCH}${NC}"
+    echo -e "  ${GREEN}✓${NC} Architecture: ${CYAN}${ARCH} (${ARCH_NAME})${NC}"
     
     command -v docker &> /dev/null || { echo -e "  ${RED}✗ Docker is not installed${NC}"; exit 1; }
     docker info &> /dev/null || { echo -e "  ${RED}✗ Docker daemon is not running${NC}"; exit 1; }
     echo -e "  ${GREEN}✓${NC} Docker running"
     
     if [ ! -f "./wings" ]; then
-        echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup...${NC}"
-        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/Release/wings"
+        echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
+        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/Release/${BINARY_NAME}"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
-            echo -e "  ${GREEN}✓${NC} Download complete"
+            echo -e "  ${GREEN}✓${NC} Download complete (${BINARY_NAME})"
             chmod +x wings
         else
             echo -e "  ${RED}✗ Failed to download wings binary!${NC}"
+            echo -e "  ${YELLOW}  URL: ${DOWNLOAD_URL}${NC}"
             echo -e "  ${YELLOW}  Possible causes: Repository is private or file name mismatch.${NC}"
             exit 1
         fi
