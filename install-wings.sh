@@ -123,8 +123,8 @@ install_wings_dedup() {
         LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$LATEST_TAG" ]; then
             echo -e "  ${RED}✗ Failed to fetch latest release tag${NC}"
-            echo -e "  ${YELLOW}  Falling back to v2.2...${NC}"
-            LATEST_TAG="v2.2"
+            echo -e "  ${YELLOW}  Falling back to v2.1...${NC}"
+            LATEST_TAG="v2.1"
         else
             echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
         fi
