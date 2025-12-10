@@ -118,7 +118,7 @@ install_wings_dedup() {
     
     if [ ! -f "./wings" ]; then
         echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
-        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/v2.1/${BINARY_NAME}"
+        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/v2.2/${BINARY_NAME}"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
             echo -e "  ${GREEN}✓${NC} Download complete (${BINARY_NAME})"
