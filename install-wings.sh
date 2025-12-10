@@ -162,6 +162,23 @@ install_wings_dedup() {
 
     mkdir -p /etc/pterodactyl /var/lib/pterodactyl/{volumes,backups,archives} /var/log/pterodactyl /run/wings
     echo -e "  ${GREEN}✓${NC} Directories created"
+
+    # Create pterodactyl user if not exists and fix home directory
+    if id "pterodactyl" &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Pterodactyl user exists"
+    else
+        useradd --system --no-create-home --shell /bin/false pterodactyl 2>/dev/null || true
+        echo -e "  ${GREEN}✓${NC} Pterodactyl user created"
+    fi
+
+    # Ensure home directory exists (required for borg pre-flight)
+    mkdir -p /home/pterodactyl
+    chown pterodactyl:pterodactyl /home/pterodactyl
+    echo -e "  ${GREEN}✓${NC} Pterodactyl home directory ready"
+
+    # Fix directory ownership (required for borg pre-flight)
+    chown -R pterodactyl:pterodactyl /var/lib/pterodactyl
+    echo -e "  ${GREEN}✓${NC} Directory ownership fixed"
     echo ""
 
     # Step 3: Panel Configuration (FIRST - before asking for dedup settings)
