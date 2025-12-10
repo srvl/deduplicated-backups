@@ -39,7 +39,7 @@ prompt_required() {
             echo -e "${RED}  ✗ This field is required.${NC}"
         fi
     done
-    eval "$var_name='$value'"
+    printf -v "$var_name" '%s' "$value"
 }
 
 # Function to prompt with default
@@ -54,7 +54,7 @@ prompt_with_default() {
     if [ -z "$value" ]; then
         value="$default"
     fi
-    eval "$var_name='$value'"
+    printf -v "$var_name" '%s' "$value"
 }
 
 # Function to prompt optional (can be empty)
@@ -65,7 +65,7 @@ prompt_optional() {
 
     echo -en "$prompt"
     read -r value
-    eval "$var_name='$value'"
+    printf -v "$var_name" '%s' "$value"
 }
 
 # Cleanup function for error handling
@@ -123,17 +123,35 @@ install_wings_dedup() {
         LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$LATEST_TAG" ]; then
             echo -e "  ${RED}✗ Failed to fetch latest release tag${NC}"
-            echo -e "  ${YELLOW}  Falling back to v2.1...${NC}"
-            LATEST_TAG="v2.1"
+            echo -e "  ${YELLOW}  Falling back to v2.2...${NC}"
+            LATEST_TAG="v2.2"
         else
             echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
         fi
         
         DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
+        CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
             echo -e "  ${GREEN}✓${NC} Download complete (${BINARY_NAME})"
             chmod +x wings
+            
+            # Verify SHA256 checksum if available
+            if curl -f -s -L -o wings.sha256 "$CHECKSUM_URL" 2>/dev/null; then
+                EXPECTED_SHA256=$(cat wings.sha256 | awk '{print $1}')
+                ACTUAL_SHA256=$(sha256sum wings | awk '{print $1}')
+                if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+                    echo -e "  ${RED}✗ SHA256 checksum mismatch!${NC}"
+                    echo -e "  ${YELLOW}  Expected: ${EXPECTED_SHA256}${NC}"
+                    echo -e "  ${YELLOW}  Actual:   ${ACTUAL_SHA256}${NC}"
+                    rm -f wings wings.sha256
+                    exit 1
+                fi
+                echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
+                rm -f wings.sha256
+            else
+                echo -e "  ${YELLOW}○${NC} No checksum file available, skipping verification"
+            fi
         else
             echo -e "  ${RED}✗ Failed to download wings binary!${NC}"
             echo -e "  ${YELLOW}  URL: ${DOWNLOAD_URL}${NC}"
@@ -234,7 +252,9 @@ install_wings_dedup() {
 
         echo ""
         echo -e "  ${YELLOW}Running configuration command...${NC}"
-        eval "$AUTODEPLOY_CMD" || {
+        # Execute the auto-deploy command safely using bash -c
+        # This is necessary for the panel's configure command which uses shell features
+        bash -c "$AUTODEPLOY_CMD" || {
             echo -e "  ${RED}✗ Failed to run auto-deploy command${NC}"
             exit 1
         }
@@ -255,7 +275,16 @@ install_wings_dedup() {
     echo ""
     
     echo -e "  ${CYAN}── License ──${NC}"
-    prompt_required "  License Key: " LICENSE_KEY
+    echo -e "  ${YELLOW}  Format: alphanumeric with optional hyphens (e.g., abc123-def456)${NC}"
+    while true; do
+        prompt_required "  License Key: " LICENSE_KEY
+        # Validate license key format (letters, numbers, hyphens, 10-50 chars)
+        if [[ "$LICENSE_KEY" =~ ^[a-zA-Z0-9-]{10,50}$ ]]; then
+            break
+        else
+            echo -e "  ${RED}  ✗ Invalid format. Must be 10-50 alphanumeric characters (hyphens allowed).${NC}"
+        fi
+    done
     echo ""
     
     echo -e "  ${CYAN}── Borg Backup (Unencrypted for Speed) ──${NC}"
@@ -497,6 +526,124 @@ uninstall_wings_dedup() {
     exit 0
 }
 
+# --- Update Only Logic ---
+
+update_only() {
+    echo -e "${GREEN}"
+    echo "╔═══════════════════════════════════════════════════════════╗"
+    echo "║               Wings-Dedup Quick Update                    ║"
+    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    # Step 1: Architecture detection
+    echo -e "${BLUE}${BOLD}[Step 1/3] Detecting architecture...${NC}"
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64|amd64)
+            ARCH_NAME="amd64"
+            BINARY_NAME="wings_amd"
+            ;;
+        aarch64|arm64)
+            ARCH_NAME="arm64"
+            BINARY_NAME="wings_arm"
+            ;;
+        *)
+            echo -e "  ${RED}✗ Unsupported architecture: ${ARCH}${NC}"
+            exit 1
+            ;;
+    esac
+    echo -e "  ${GREEN}✓${NC} Architecture: ${CYAN}${ARCH} (${ARCH_NAME})${NC}"
+    echo ""
+
+    # Step 2: Get binary (local or download)
+    echo -e "${BLUE}${BOLD}[Step 2/3] Getting Wings-Dedup binary...${NC}"
+    
+    if [ -f "./wings" ]; then
+        echo -e "  ${GREEN}✓${NC} Using local binary: ${CYAN}./wings${NC}"
+        if ! file ./wings | grep -qE "(executable|ELF)"; then
+            echo -e "  ${RED}✗ Invalid binary file${NC}"
+            exit 1
+        fi
+    else
+        echo -e "  ${YELLOW}Downloading latest release...${NC}"
+        
+        LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$LATEST_TAG" ]; then
+            echo -e "  ${RED}✗ Failed to fetch latest release${NC}"
+            exit 1
+        fi
+        echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
+        
+        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
+        CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
+        
+        if curl -f -L -o wings "$DOWNLOAD_URL"; then
+            echo -e "  ${GREEN}✓${NC} Download complete"
+            chmod +x wings
+            
+            # Verify SHA256 checksum if available
+            if curl -f -s -L -o wings.sha256 "$CHECKSUM_URL" 2>/dev/null; then
+                EXPECTED_SHA256=$(cat wings.sha256 | awk '{print $1}')
+                ACTUAL_SHA256=$(sha256sum wings | awk '{print $1}')
+                if [ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]; then
+                    echo -e "  ${RED}✗ SHA256 checksum mismatch!${NC}"
+                    echo -e "  ${YELLOW}  Expected: ${EXPECTED_SHA256}${NC}"
+                    echo -e "  ${YELLOW}  Actual:   ${ACTUAL_SHA256}${NC}"
+                    rm -f wings wings.sha256
+                    exit 1
+                fi
+                echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
+                rm -f wings.sha256
+            else
+                echo -e "  ${YELLOW}○${NC} No checksum file available, skipping verification"
+            fi
+        else
+            echo -e "  ${RED}✗ Failed to download${NC}"
+            exit 1
+        fi
+    fi
+    
+    NEW_VERSION=$(./wings --version 2>/dev/null | head -1 || echo "unknown")
+    echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
+    echo ""
+
+    # Step 3: Replace binary and restart
+    echo -e "${BLUE}${BOLD}[Step 3/3] Installing and restarting...${NC}"
+    
+    if systemctl is-active --quiet wings 2>/dev/null; then
+        echo -e "  ${YELLOW}Stopping Wings...${NC}"
+        systemctl stop wings
+    fi
+    
+    # Backup current if not already backed up
+    if [ -f "$WINGS_BINARY" ] && [ ! -f "$BACKUP_BINARY_PATH" ]; then
+        cp "$WINGS_BINARY" "$BACKUP_BINARY_PATH"
+        echo -e "  ${GREEN}✓${NC} Original backed up"
+    fi
+    
+    cp wings "$WINGS_BINARY"
+    chmod +x "$WINGS_BINARY"
+    rm -f wings
+    echo -e "  ${GREEN}✓${NC} Binary replaced"
+    
+    systemctl start wings
+    sleep 2
+    
+    if systemctl is-active --quiet wings; then
+        echo -e "  ${GREEN}✓${NC} Wings-Dedup is running!"
+    else
+        echo -e "  ${RED}✗ Wings failed to start${NC}"
+        echo -e "  ${YELLOW}Check logs: journalctl -u wings -f${NC}"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}✓ Update Complete!${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    trap '' EXIT
+    exit 0
+}
+
 # --- Main Menu ---
 
 main_menu() {
@@ -514,17 +661,19 @@ main_menu() {
         echo -e "${NC}"
         
         echo -e "${BOLD}Select an option:${NC}"
-        echo -e "  ${GREEN}1)${NC} Install/Update Wings-Dedup"
-        echo -e "  ${RED}2)${NC} Uninstall/Restore Original Wings"
-        echo -e "  ${YELLOW}3)${NC} Exit"
+        echo -e "  ${GREEN}1)${NC} Install/Update Wings-Dedup (Full Setup)"
+        echo -e "  ${CYAN}2)${NC} Update Only (Binary replacement, no config)"
+        echo -e "  ${RED}3)${NC} Uninstall/Restore Original Wings"
+        echo -e "  ${YELLOW}4)${NC} Exit"
         echo ""
         
-        read -p "Choice (1-3): " -r CHOICE
+        read -p "Choice (1-4): " -r CHOICE
 
         case "$CHOICE" in
             1) echo ""; install_wings_dedup ;;
-            2) echo ""; uninstall_wings_dedup ;;
-            3) echo -e "\n${BLUE}Goodbye!${NC}"; exit 0 ;;
+            2) echo ""; update_only ;;
+            3) echo ""; uninstall_wings_dedup ;;
+            4) echo -e "\n${BLUE}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "\n${RED}Invalid choice${NC}" ;;
         esac
         echo ""
@@ -532,3 +681,4 @@ main_menu() {
 }
 
 main_menu "menu"
+
