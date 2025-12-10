@@ -118,7 +118,18 @@ install_wings_dedup() {
     
     if [ ! -f "./wings" ]; then
         echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
-        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/v2.2/${BINARY_NAME}"
+        
+        # Fetch latest release tag from GitHub API
+        LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$LATEST_TAG" ]; then
+            echo -e "  ${RED}✗ Failed to fetch latest release tag${NC}"
+            echo -e "  ${YELLOW}  Falling back to v2.1...${NC}"
+            LATEST_TAG="v2.1"
+        else
+            echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
+        fi
+        
+        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
             echo -e "  ${GREEN}✓${NC} Download complete (${BINARY_NAME})"
