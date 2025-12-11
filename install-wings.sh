@@ -567,9 +567,18 @@ update_only() {
     else
         echo -e "  ${YELLOW}Downloading latest release...${NC}"
         
-        LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        API_URL="https://api.github.com/repos/srvl/deduplicated-backups/releases/latest"
+        API_RESPONSE=$(curl -s "$API_URL")
+        LATEST_TAG=$(echo "$API_RESPONSE" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        
         if [ -z "$LATEST_TAG" ]; then
             echo -e "  ${RED}✗ Failed to fetch latest release${NC}"
+            # Show error details for debugging
+            API_MESSAGE=$(echo "$API_RESPONSE" | grep '"message":' | sed -E 's/.*"message": *"([^"]+)".*/\1/')
+            if [ -n "$API_MESSAGE" ]; then
+                echo -e "  ${YELLOW}  GitHub API: ${API_MESSAGE}${NC}"
+            fi
+            echo -e "  ${YELLOW}  API URL: ${API_URL}${NC}"
             exit 1
         fi
         echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
