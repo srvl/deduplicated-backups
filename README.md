@@ -11,7 +11,7 @@ Always installs the latest stable version.
 1. Connect to your VPS using SSH
 2. Run this command:
 
-bash <(curl -sL https://github.com/srvl/deduplicated-backups/raw/main/install-wings.sh)
+```bash <(curl -sL https://github.com/srvl/deduplicated-backups/raw/main/install-wings.sh)```
 
 3. Follow the interactive setup to complete installation.
 
