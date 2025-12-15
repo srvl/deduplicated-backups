@@ -322,6 +322,28 @@ install_wings_dedup() {
         fi
         echo -e "  ${GREEN}✓${NC} BorgBackup installed"
     fi
+
+    # Install rsync (required for DR sync to remote storage)
+    if command -v rsync &> /dev/null; then
+        RSYNC_VERSION=$(rsync --version 2>/dev/null | head -1 || echo "installed")
+        echo -e "  ${GREEN}✓${NC} rsync: ${CYAN}${RSYNC_VERSION}${NC}"
+    else
+        echo -e "  ${YELLOW}Installing rsync (for disaster recovery sync)...${NC}"
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y -qq rsync > /dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y -q rsync > /dev/null 2>&1
+        elif command -v yum &> /dev/null; then
+            yum install -y -q rsync > /dev/null 2>&1
+        elif command -v pacman &> /dev/null; then
+            pacman -Sy --noconfirm rsync > /dev/null 2>&1
+        else
+            echo -e "  ${YELLOW}○${NC} Could not install rsync. Install manually for DR sync."
+        fi
+        if command -v rsync &> /dev/null; then
+            echo -e "  ${GREEN}✓${NC} rsync installed"
+        fi
+    fi
     
     mkdir -p "$BORG_REPO"
 
@@ -347,7 +369,7 @@ EOF
             # Add borg section - find backups: and add after it, or add whole section
             if grep -q "backups:" "$CONFIG_FILE"; then
                 # Insert borg config after backups:
-                sed -i '/backups:/a\    borg:\n      enabled: true\n      repository_path: "'"$BORG_REPO"'"\n      encryption_mode: none\n      compression: lz4' "$CONFIG_FILE"
+                sed -i '/backups:/a\    borg:\n      enabled: true\n      repository_path: "'"$BORG_REPO"'"\n      compression: lz4\n      encryption:\n        enabled: false' "$CONFIG_FILE"
             else
                 # Add backups section with borg
                 cat >> "$CONFIG_FILE" <<EOF
@@ -358,14 +380,14 @@ system:
     borg:
       enabled: true
       repository_path: "${BORG_REPO}"
-      encryption_mode: none
       compression: lz4
+      encryption:
+        enabled: false
 EOF
             fi
         else
             # Update existing borg settings
             sed -i "s|repository_path:.*|repository_path: \"${BORG_REPO}\"|" "$CONFIG_FILE"
-            sed -i "s|encryption_mode:.*|encryption_mode: none|" "$CONFIG_FILE"
         fi
     else
         # No system section - append full config
@@ -377,18 +399,22 @@ system:
     borg:
       enabled: true
       repository_path: "${BORG_REPO}"
-      encryption_mode: none
       compression: lz4
+      encryption:
+        enabled: false
 EOF
     fi
     echo -e "  ${GREEN}✓${NC} Borg backup configured (unencrypted)"
 
-    # Add Discord webhook if provided
+    # Add Discord webhook if provided (under notifications section)
     if [ -n "$DISCORD_WEBHOOK" ]; then
-        if ! grep -q "discord_webhook:" "$CONFIG_FILE"; then
-            # Add under borg section
-            sed -i "/borg:/,/compression:/ { /compression:/a\      discord_webhook: \"${DISCORD_WEBHOOK}\" }" "$CONFIG_FILE" 2>/dev/null || \
-            sed -i "s|compression: lz4|compression: lz4\n      discord_webhook: \"${DISCORD_WEBHOOK}\"|" "$CONFIG_FILE"
+        if ! grep -q "notifications:" "$CONFIG_FILE"; then
+            # Add notifications section under borg
+            sed -i "/borg:/,/encryption:/ { /enabled: false/a\\      notifications:\\n        discord_webhook: \"${DISCORD_WEBHOOK}\" }" "$CONFIG_FILE" 2>/dev/null || \
+            cat >> "$CONFIG_FILE" <<EOF
+      notifications:
+        discord_webhook: "${DISCORD_WEBHOOK}"
+EOF
         else
             sed -i "s|discord_webhook:.*|discord_webhook: \"${DISCORD_WEBHOOK}\"|" "$CONFIG_FILE"
         fi
