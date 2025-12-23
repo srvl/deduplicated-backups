@@ -720,6 +720,8 @@ EOF
     echo
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         echo ""
+        # Migrate legacy config if this was an upgrade
+        migrate_legacy_config
         systemctl start wings
         sleep 3
         if systemctl is-active --quiet wings; then
