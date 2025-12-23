@@ -84,6 +84,86 @@ cleanup() {
 }
 trap 'cleanup $1' EXIT
 
+# --- Config Migration ---
+
+# Migrate legacy DisasterRecovery config to new Remote format
+# This allows seamless upgrade from older Wings-Dedup versions
+migrate_legacy_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+
+    # Check if legacy disaster_recovery section exists
+    if ! grep -q "disaster_recovery:" "$CONFIG_FILE" 2>/dev/null; then
+        return 0
+    fi
+
+    # Check if already migrated (has remote: section under borg:)
+    if grep -q "^      remote:" "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Config already using new format"
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}Migrating legacy config to new format...${NC}"
+
+    # Create backup
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.pre-migration.$(date +%Y%m%d_%H%M%S)"
+
+    # Extract legacy values using grep/sed
+    LEGACY_REMOTE_REPO=$(grep -E "^\s+remote_repository:" "$CONFIG_FILE" | sed 's/.*remote_repository:\s*//' | tr -d '"' | tr -d "'" | head -1)
+    LEGACY_SSH_KEY=$(grep -E "^\s+ssh_key:" "$CONFIG_FILE" | sed 's/.*ssh_key:\s*//' | tr -d '"' | tr -d "'" | head -1)
+    LEGACY_SSH_PORT=$(grep -E "^\s+ssh_port:" "$CONFIG_FILE" | sed 's/.*ssh_port:\s*//' | head -1)
+    LEGACY_BORG_PATH=$(grep -E "^\s+borg_path:" "$CONFIG_FILE" | sed 's/.*borg_path:\s*//' | tr -d '"' | tr -d "'" | head -1)
+    LEGACY_SYNC_MODE=$(grep -E "^\s+sync_mode:" "$CONFIG_FILE" | sed 's/.*sync_mode:\s*//' | tr -d '"' | tr -d "'" | head -1)
+    LEGACY_BW_LIMIT=$(grep -E "^\s+upload_bwlimit:" "$CONFIG_FILE" | sed 's/.*upload_bwlimit:\s*//' | tr -d '"' | tr -d "'" | head -1)
+
+    # Only migrate if we found a remote repository
+    if [ -z "$LEGACY_REMOTE_REPO" ]; then
+        echo -e "  ${YELLOW}○${NC} No remote repository in legacy config, skipping migration"
+        return 0
+    fi
+
+    # Set defaults
+    LEGACY_SSH_PORT="${LEGACY_SSH_PORT:-23}"
+    LEGACY_BORG_PATH="${LEGACY_BORG_PATH:-borg-1.4}"
+    LEGACY_SYNC_MODE="${LEGACY_SYNC_MODE:-rsync}"
+    LEGACY_BW_LIMIT="${LEGACY_BW_LIMIT:-50M}"
+
+    # Build new config block
+    NEW_REMOTE_CONFIG="      remote:
+        repository: \"${LEGACY_REMOTE_REPO}\"
+        ssh_key: \"${LEGACY_SSH_KEY}\"
+        ssh_port: ${LEGACY_SSH_PORT}
+        borg_path: \"${LEGACY_BORG_PATH}\"
+      sync:
+        mode: ${LEGACY_SYNC_MODE}
+        workers: 1
+        upload_bwlimit: \"${LEGACY_BW_LIMIT}\""
+
+    # Insert new config after 'encryption:' block in borg section
+    # This is a simple approach - append after the borg section header
+    if grep -q "^    borg:" "$CONFIG_FILE" 2>/dev/null; then
+        # Use a temp file approach for complex sed
+        awk -v new_config="$NEW_REMOTE_CONFIG" '
+            /^    borg:/ { in_borg=1 }
+            in_borg && /^      encryption:/ { in_encryption=1 }
+            in_encryption && /^      [a-z]/ && !/^      encryption/ { 
+                print new_config
+                in_encryption=0 
+            }
+            { print }
+            END { if(in_encryption) print new_config }
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    fi
+
+    # Remove old disaster_recovery section
+    sed -i '/^      disaster_recovery:/,/^      [a-z]/{ /^      disaster_recovery:/d; /^        /d; }' "$CONFIG_FILE" 2>/dev/null || true
+
+    echo -e "  ${GREEN}✓${NC} Config migrated to new format"
+    echo -e "  ${CYAN}  Remote: ${LEGACY_REMOTE_REPO}${NC}"
+    echo -e "  ${CYAN}  Sync mode: ${LEGACY_SYNC_MODE}${NC}"
+}
+
 # --- Core Installation Logic ---
 
 install_wings_dedup() {
@@ -286,9 +366,85 @@ install_wings_dedup() {
         fi
     done
     echo ""
-    
-    echo -e "  ${CYAN}── Borg Backup (Unencrypted for Speed) ──${NC}"
-    prompt_with_default "  Repository Path" "$DEFAULT_BORG_REPO" BORG_REPO
+
+    # Backend Selection
+    echo -e "  ${CYAN}── Backup Backend ──${NC}"
+    echo -e "  ${YELLOW}  Which backup technology to use:${NC}"
+    echo -e "    ${GREEN}1)${NC} Borg (SSH/local storage) - Recommended for NAS/Storage Box"
+    echo -e "    ${GREEN}2)${NC} Kopia (S3/object storage) - For AWS S3, Backblaze B2, Wasabi, R2"
+    echo ""
+    while true; do
+        read -p "  Backend [1]: " BACKEND_CHOICE
+        BACKEND_CHOICE="${BACKEND_CHOICE:-1}"
+        if [[ "$BACKEND_CHOICE" == "1" ]]; then
+            BACKUP_BACKEND="borg"
+            break
+        elif [[ "$BACKEND_CHOICE" == "2" ]]; then
+            BACKUP_BACKEND="kopia"
+            break
+        else
+            echo -e "  ${RED}  ✗ Choose 1 or 2${NC}"
+        fi
+    done
+    echo -e "  ${GREEN}✓${NC} Backend: ${CYAN}${BACKUP_BACKEND}${NC}"
+    echo ""
+
+    # Storage Mode Selection
+    echo -e "  ${CYAN}── Storage Mode ──${NC}"
+    echo -e "  ${YELLOW}  Where to store backups:${NC}"
+    echo -e "    ${GREEN}1)${NC} Local only - Backups stay on this node (fastest)"
+    echo -e "    ${GREEN}2)${NC} Remote only - Backups go directly to remote storage (saves local disk)"
+    echo -e "    ${GREEN}3)${NC} Hybrid - Local + synced to remote (best reliability, recommended)"
+    echo ""
+    while true; do
+        read -p "  Storage mode [1]: " STORAGE_CHOICE
+        STORAGE_CHOICE="${STORAGE_CHOICE:-1}"
+        if [[ "$STORAGE_CHOICE" == "1" ]]; then
+            STORAGE_MODE="local"
+            break
+        elif [[ "$STORAGE_CHOICE" == "2" ]]; then
+            STORAGE_MODE="remote"
+            break
+        elif [[ "$STORAGE_CHOICE" == "3" ]]; then
+            STORAGE_MODE="hybrid"
+            break
+        else
+            echo -e "  ${RED}  ✗ Choose 1, 2, or 3${NC}"
+        fi
+    done
+    echo -e "  ${GREEN}✓${NC} Storage mode: ${CYAN}${STORAGE_MODE}${NC}"
+    echo ""
+
+    # Backend-specific settings
+    if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+        echo -e "  ${CYAN}── Borg Configuration ──${NC}"
+        prompt_with_default "  Local Repository Path" "$DEFAULT_BORG_REPO" BORG_REPO
+        
+        if [[ "$STORAGE_MODE" != "local" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}  Remote SSH storage (e.g., Hetzner Storage Box)${NC}"
+            echo -e "  ${YELLOW}  Format: ssh://user@host:port/./path or user@host:path${NC}"
+            prompt_optional "  Remote Repository: " REMOTE_REPO
+            if [ -n "$REMOTE_REPO" ]; then
+                prompt_with_default "  SSH Port" "23" SSH_PORT
+                prompt_with_default "  SSH Key Path" "/root/.ssh/id_ed25519" SSH_KEY
+                prompt_with_default "  Remote Borg Path" "borg-1.4" REMOTE_BORG_PATH
+            fi
+        fi
+    else
+        echo -e "  ${CYAN}── Kopia S3 Configuration ──${NC}"
+        echo -e "  ${YELLOW}  Configure S3-compatible object storage${NC}"
+        echo ""
+        prompt_required "  S3 Endpoint (e.g., s3.amazonaws.com): " S3_ENDPOINT
+        prompt_with_default "  S3 Region" "us-east-1" S3_REGION
+        prompt_required "  S3 Bucket Name: " S3_BUCKET
+        prompt_required "  Access Key: " S3_ACCESS_KEY
+        prompt_required "  Secret Key: " S3_SECRET_KEY
+        
+        # Local cache for Kopia
+        prompt_with_default "  Local Cache Path" "/var/lib/pterodactyl/backups/kopia-cache" KOPIA_CACHE
+        prompt_with_default "  Cache Size (MB)" "5000" KOPIA_CACHE_SIZE
+    fi
     echo ""
     
     echo -e "  ${CYAN}── Discord Notifications (Optional) ──${NC}"
@@ -302,25 +458,88 @@ install_wings_dedup() {
     # Step 5: Install Borg, Configure, and Start
     echo -e "${BLUE}${BOLD}[Step 5/5] Finalizing...${NC}"
     
-    # Install Borg
-    if command -v borg &> /dev/null; then
-        BORG_VERSION=$(borg --version 2>/dev/null | head -1 || echo "unknown")
-        echo -e "  ${GREEN}✓${NC} BorgBackup: ${CYAN}${BORG_VERSION}${NC}"
-    else
-        echo -e "  ${YELLOW}Installing BorgBackup...${NC}"
-        if command -v apt-get &> /dev/null; then
-            apt-get update -qq && apt-get install -y -qq borgbackup > /dev/null 2>&1
-        elif command -v dnf &> /dev/null; then
-            dnf install -y -q borgbackup > /dev/null 2>&1
-        elif command -v yum &> /dev/null; then
-            yum install -y -q epel-release > /dev/null 2>&1 || true
-            yum install -y -q borgbackup > /dev/null 2>&1
-        elif command -v pacman &> /dev/null; then
-            pacman -Sy --noconfirm borg > /dev/null 2>&1
+    # Install backend-specific tools
+    if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+        # Install Borg
+        if command -v borg &> /dev/null; then
+            BORG_VERSION=$(borg --version 2>/dev/null | head -1 || echo "unknown")
+            echo -e "  ${GREEN}✓${NC} BorgBackup: ${CYAN}${BORG_VERSION}${NC}"
         else
-            echo -e "  ${RED}✗ Unknown package manager. Install BorgBackup manually.${NC}"; exit 1;
+            echo -e "  ${YELLOW}Installing BorgBackup...${NC}"
+            if command -v apt-get &> /dev/null; then
+                apt-get update -qq && apt-get install -y -qq borgbackup > /dev/null 2>&1
+            elif command -v dnf &> /dev/null; then
+                dnf install -y -q borgbackup > /dev/null 2>&1
+            elif command -v yum &> /dev/null; then
+                yum install -y -q epel-release > /dev/null 2>&1 || true
+                yum install -y -q borgbackup > /dev/null 2>&1
+            elif command -v pacman &> /dev/null; then
+                pacman -Sy --noconfirm borg > /dev/null 2>&1
+            else
+                echo -e "  ${RED}✗ Unknown package manager. Install BorgBackup manually.${NC}"; exit 1;
+            fi
+            echo -e "  ${GREEN}✓${NC} BorgBackup installed"
         fi
-        echo -e "  ${GREEN}✓${NC} BorgBackup installed"
+    else
+        # Install Kopia
+        if command -v kopia &> /dev/null; then
+            KOPIA_VERSION=$(kopia --version 2>/dev/null | head -1 || echo "unknown")
+            echo -e "  ${GREEN}✓${NC} Kopia: ${CYAN}${KOPIA_VERSION}${NC}"
+        else
+            echo -e "  ${YELLOW}Installing Kopia...${NC}"
+            if command -v apt-get &> /dev/null; then
+                # Add Kopia repository for Debian/Ubuntu
+                curl -fsSL https://kopia.io/signing-key | gpg --dearmor -o /usr/share/keyrings/kopia-keyring.gpg 2>/dev/null || true
+                echo "deb [signed-by=/usr/share/keyrings/kopia-keyring.gpg] https://packages.kopia.io/apt/ stable main" > /etc/apt/sources.list.d/kopia.list
+                apt-get update -qq && apt-get install -y -qq kopia > /dev/null 2>&1
+            elif command -v dnf &> /dev/null; then
+                # Add Kopia repository for Fedora
+                rpm --import https://kopia.io/signing-key 2>/dev/null || true
+                cat > /etc/yum.repos.d/kopia.repo << 'KOPIAEOF'
+[Kopia]
+name=Kopia
+baseurl=https://packages.kopia.io/rpm/stable/$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=https://kopia.io/signing-key
+KOPIAEOF
+                dnf install -y -q kopia > /dev/null 2>&1
+            elif command -v yum &> /dev/null; then
+                # Add Kopia repository for RHEL/CentOS
+                rpm --import https://kopia.io/signing-key 2>/dev/null || true
+                cat > /etc/yum.repos.d/kopia.repo << 'KOPIAEOF'
+[Kopia]
+name=Kopia
+baseurl=https://packages.kopia.io/rpm/stable/$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=https://kopia.io/signing-key
+KOPIAEOF
+                yum install -y -q kopia > /dev/null 2>&1
+            elif command -v pacman &> /dev/null; then
+                # Arch Linux - install from AUR or binary
+                echo -e "  ${YELLOW}Installing Kopia from binary...${NC}"
+                KOPIA_LATEST=$(curl -s https://api.github.com/repos/kopia/kopia/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+                curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_LATEST}/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}.tar.gz"
+                tar -xzf /tmp/kopia.tar.gz -C /tmp
+                mv /tmp/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}/kopia /usr/local/bin/
+                rm -rf /tmp/kopia* 
+            else
+                # Fallback: download binary
+                echo -e "  ${YELLOW}Installing Kopia from binary...${NC}"
+                KOPIA_LATEST=$(curl -s https://api.github.com/repos/kopia/kopia/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+                curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_LATEST}/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}.tar.gz"
+                tar -xzf /tmp/kopia.tar.gz -C /tmp
+                mv /tmp/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}/kopia /usr/local/bin/
+                rm -rf /tmp/kopia*
+            fi
+            
+            if command -v kopia &> /dev/null; then
+                echo -e "  ${GREEN}✓${NC} Kopia installed"
+            else
+                echo -e "  ${RED}✗ Failed to install Kopia. Install manually from https://kopia.io${NC}"; exit 1;
+            fi
+        fi
     fi
 
     # Install rsync (required for DR sync to remote storage)
@@ -345,7 +564,12 @@ install_wings_dedup() {
         fi
     fi
     
-    mkdir -p "$BORG_REPO"
+    # Create directories based on backend
+    if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+        mkdir -p "$BORG_REPO"
+    else
+        mkdir -p "$KOPIA_CACHE"
+    fi
 
     # Update config.yml with Wings-Dedup settings
     # Add license section
@@ -361,66 +585,102 @@ EOF
     fi
     echo -e "  ${GREEN}✓${NC} License configured"
 
-    # Add/update borg settings under system.backups
-    # First check if system.backups.borg exists
-    if grep -q "^  backups:" "$CONFIG_FILE" 2>/dev/null || grep -q "^system:" "$CONFIG_FILE" 2>/dev/null; then
-        # Check if borg section exists
-        if ! grep -q "borg:" "$CONFIG_FILE"; then
-            # Add borg section - find backups: and add after it, or add whole section
-            if grep -q "backups:" "$CONFIG_FILE"; then
-                # Insert borg config after backups:
-                sed -i '/backups:/a\    borg:\n      enabled: true\n      repository_path: "'"$BORG_REPO"'"\n      compression: lz4\n      encryption:\n        enabled: false' "$CONFIG_FILE"
-            else
-                # Add backups section with borg
-                cat >> "$CONFIG_FILE" <<EOF
-
-# Borg Backup Configuration
-system:
-  backups:
-    borg:
-      enabled: true
-      repository_path: "${BORG_REPO}"
-      compression: lz4
-      encryption:
-        enabled: false
-EOF
-            fi
-        else
-            # Update existing borg settings
-            sed -i "s|repository_path:.*|repository_path: \"${BORG_REPO}\"|" "$CONFIG_FILE"
-        fi
-    else
-        # No system section - append full config
-        cat >> "$CONFIG_FILE" <<EOF
-
-# Borg Backup Configuration  
-system:
-  backups:
-    borg:
-      enabled: true
-      repository_path: "${BORG_REPO}"
-      compression: lz4
-      encryption:
-        enabled: false
-EOF
+    # Generate backup configuration with new structure
+    # Remove any existing borg/kopia config and replace with new structure
+    if grep -q "^  backups:" "$CONFIG_FILE" 2>/dev/null; then
+        # Will update in place
+        echo -e "  ${YELLOW}Updating existing backup configuration...${NC}"
     fi
-    echo -e "  ${GREEN}✓${NC} Borg backup configured (unencrypted)"
 
-    # Add Discord webhook if provided (under notifications section)
-    if [ -n "$DISCORD_WEBHOOK" ]; then
-        if ! grep -q "notifications:" "$CONFIG_FILE"; then
-            # Add notifications section under borg
-            sed -i "/borg:/,/encryption:/ { /enabled: false/a\\      notifications:\\n        discord_webhook: \"${DISCORD_WEBHOOK}\" }" "$CONFIG_FILE" 2>/dev/null || \
-            cat >> "$CONFIG_FILE" <<EOF
-      notifications:
-        discord_webhook: "${DISCORD_WEBHOOK}"
-EOF
-        else
-            sed -i "s|discord_webhook:.*|discord_webhook: \"${DISCORD_WEBHOOK}\"|" "$CONFIG_FILE"
+    # Build the backup config block based on selections
+    if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+        BACKUP_CONFIG="
+# Wings-Dedup Backup Configuration
+  backups:
+    backend: \"${BACKUP_BACKEND}\"
+    storage_mode: \"${STORAGE_MODE}\"
+    
+    borg:
+      enabled: true
+      local_repository: \"${BORG_REPO}\"
+      compression: lz4
+      encryption:
+        enabled: false"
+        
+        # Add remote config if provided
+        if [ -n "$REMOTE_REPO" ]; then
+            BACKUP_CONFIG+="
+      remote:
+        repository: \"${REMOTE_REPO}\"
+        ssh_key: \"${SSH_KEY}\"
+        ssh_port: ${SSH_PORT}
+        borg_path: \"${REMOTE_BORG_PATH}\"
+      sync:
+        mode: rsync
+        workers: 1
+        upload_bwlimit: \"50M\""
         fi
+        
+        echo -e "  ${GREEN}✓${NC} Borg backup configured (${STORAGE_MODE} mode)"
+    else
+        # Kopia configuration
+        BACKUP_CONFIG="
+# Wings-Dedup Backup Configuration  
+  backups:
+    backend: \"${BACKUP_BACKEND}\"
+    storage_mode: \"${STORAGE_MODE}\"
+    
+    kopia:
+      enabled: true
+      s3:
+        endpoint: \"${S3_ENDPOINT}\"
+        region: \"${S3_REGION}\"
+        bucket: \"${S3_BUCKET}\"
+        access_key: \"${S3_ACCESS_KEY}\"
+        secret_key: \"${S3_SECRET_KEY}\"
+      cache:
+        enabled: true
+        path: \"${KOPIA_CACHE}\"
+        size_mb: ${KOPIA_CACHE_SIZE}
+      encryption:
+        enabled: true
+        password: \"\""
+        
+        echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
+    fi
+    
+    # Add notifications if webhook provided
+    if [ -n "$DISCORD_WEBHOOK" ]; then
+        BACKUP_CONFIG+="
+    notifications:
+      discord_webhook: \"${DISCORD_WEBHOOK}\""
         echo -e "  ${GREEN}✓${NC} Discord webhook configured"
     else
         echo -e "  ${YELLOW}○${NC} Discord webhook skipped"
+    fi
+
+    # Append to config file if system section exists, otherwise create it
+    if grep -q "^system:" "$CONFIG_FILE" 2>/dev/null; then
+        if grep -q "^  backups:" "$CONFIG_FILE" 2>/dev/null; then
+            # Remove old backups section and replace
+            # This is complex with sed, so we'll append and warn
+            echo -e "  ${YELLOW}Note: Existing backups section preserved. Review config.yml to merge settings.${NC}"
+            cat >> "$CONFIG_FILE" <<EOF
+${BACKUP_CONFIG}
+EOF
+        else
+            # Insert after system:
+            sed -i "/^system:/a\\${BACKUP_CONFIG}" "$CONFIG_FILE" 2>/dev/null || \
+            cat >> "$CONFIG_FILE" <<EOF
+${BACKUP_CONFIG}
+EOF
+        fi
+    else
+        cat >> "$CONFIG_FILE" <<EOF
+
+system:
+${BACKUP_CONFIG}
+EOF
     fi
 
     chmod 600 "$CONFIG_FILE"
@@ -660,6 +920,9 @@ update_only() {
     chmod +x "$WINGS_BINARY"
     rm -f wings
     echo -e "  ${GREEN}✓${NC} Binary replaced"
+    
+    # Migrate legacy config if needed
+    migrate_legacy_config
     
     systemctl start wings
     sleep 2
