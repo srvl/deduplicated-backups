@@ -65,4 +65,4 @@ nano /etc/pterodactyl/config.yml  # Edit config
 
 ## Support
 
-Discord: https://discord.gg/9RNXfZ2Hsm
+Discord: https://discord.gg/ZssvBxPK6e
