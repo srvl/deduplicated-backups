@@ -608,61 +608,59 @@ EOF
         echo -e "  ${YELLOW}Updating existing backup configuration...${NC}"
     fi
 
-    # Build the backup config block based on selections
+# Build the backup config block based on selections
     if [[ "$BACKUP_BACKEND" == "borg" ]]; then
         BACKUP_CONFIG="
 # Wings-Dedup Backup Configuration
-  backups:
-    backend: \"${BACKUP_BACKEND}\"
-    storage_mode: \"${STORAGE_MODE}\"
-    
-    borg:
-      enabled: true
-      local_repository: \"${BORG_REPO}\"
-      compression: lz4
-      encryption:
-        enabled: false"
+backups:
+  backend: \"${BACKUP_BACKEND}\"
+  storage_mode: \"${STORAGE_MODE}\"
+  borg:
+    enabled: true
+    local_repository: \"${BORG_REPO}\"
+    compression: lz4
+    encryption:
+      enabled: false"
         
         # Add remote config if provided
         if [ -n "$REMOTE_REPO" ]; then
             BACKUP_CONFIG+="
-      remote:
-        repository: \"${REMOTE_REPO}\"
-        ssh_key: \"${SSH_KEY}\"
-        ssh_port: ${SSH_PORT}
-        borg_path: \"${REMOTE_BORG_PATH}\"
-      sync:
-        mode: rsync
-        workers: 1
-        upload_bwlimit: \"50M\""
+    remote:
+      repository: \"${REMOTE_REPO}\"
+      ssh_key: \"${SSH_KEY}\"
+      ssh_port: ${SSH_PORT}
+      borg_path: \"${REMOTE_BORG_PATH}\"
+    sync:
+      mode: rsync
+      workers: 1
+      upload_bwlimit: \"50M\""
         fi
         
         echo -e "  ${GREEN}✓${NC} Borg backup configured (${STORAGE_MODE} mode)"
     else
         # Kopia configuration
         BACKUP_CONFIG="
-# Wings-Dedup Backup Configuration  
-  backups:
-    backend: \"${BACKUP_BACKEND}\"
-    storage_mode: \"${STORAGE_MODE}\"
-    
-    kopia:
+# Wings-Dedup Backup Configuration
+backups:
+  backend: \"${BACKUP_BACKEND}\"
+  storage_mode: \"${STORAGE_MODE}\"
+  kopia:
+    enabled: true
+    s3:
+      endpoint: \"${S3_ENDPOINT}\"
+      region: \"${S3_REGION}\"
+      bucket: \"${S3_BUCKET}\"
+      access_key: \"${S3_ACCESS_KEY}\"
+      secret_key: \"${S3_SECRET_KEY}\"
+    cache:
       enabled: true
-      s3:
-        endpoint: \"${S3_ENDPOINT}\"
-        region: \"${S3_REGION}\"
-        bucket: \"${S3_BUCKET}\"
-        access_key: \"${S3_ACCESS_KEY}\"
-        secret_key: \"${S3_SECRET_KEY}\"
-      cache:
-        enabled: true
-        path: \"${KOPIA_CACHE}\"
-        size_mb: ${KOPIA_CACHE_SIZE}
-      performance:
-        upload_bwlimit: \"${KOPIA_BWLIMIT}\"
-      encryption:
-        enabled: true
-        password: \"${KOPIA_PASSWORD}\""
+      path: \"${KOPIA_CACHE}\"
+      size_mb: ${KOPIA_CACHE_SIZE}
+    performance:
+      upload_bwlimit: \"${KOPIA_BWLIMIT}\"
+    encryption:
+      enabled: true
+      password: \"${KOPIA_PASSWORD}\""
         
         echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
     fi
@@ -670,8 +668,8 @@ EOF
     # Add notifications if webhook provided
     if [ -n "$DISCORD_WEBHOOK" ]; then
         BACKUP_CONFIG+="
-    notifications:
-      discord_webhook: \"${DISCORD_WEBHOOK}\""
+  notifications:
+    discord_webhook: \"${DISCORD_WEBHOOK}\""
         echo -e "  ${GREEN}✓${NC} Discord webhook configured"
     else
         echo -e "  ${YELLOW}○${NC} Discord webhook skipped"
