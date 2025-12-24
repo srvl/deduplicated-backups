@@ -441,6 +441,22 @@ install_wings_dedup() {
         prompt_required "  Access Key: " S3_ACCESS_KEY
         prompt_required "  Secret Key: " S3_SECRET_KEY
         
+        # Encryption password for Kopia
+        echo ""
+        echo -e "  ${YELLOW}Kopia encrypts all backups. A password is required.${NC}"
+        echo -e "  ${YELLOW}Leave blank to auto-generate a secure password.${NC}"
+        prompt_optional "  Encryption Password: " KOPIA_PASSWORD
+        if [ -z "$KOPIA_PASSWORD" ]; then
+            KOPIA_PASSWORD=$(openssl rand -base64 32)
+            echo "$KOPIA_PASSWORD" > /root/.kopia-password
+            chmod 600 /root/.kopia-password
+            echo -e "  ${GREEN}✓${NC} Auto-generated password saved to ${CYAN}/root/.kopia-password${NC}"
+            echo -e "  ${RED}  IMPORTANT: Back up this file! Loss = unrecoverable backups!${NC}"
+        fi
+        
+        # Bandwidth limiting
+        prompt_with_default "  Upload Bandwidth Limit" "50M" KOPIA_BWLIMIT
+        
         # Local cache for Kopia
         prompt_with_default "  Local Cache Path" "/var/lib/pterodactyl/backups/kopia-cache" KOPIA_CACHE
         prompt_with_default "  Cache Size (MB)" "5000" KOPIA_CACHE_SIZE
@@ -642,9 +658,11 @@ EOF
         enabled: true
         path: \"${KOPIA_CACHE}\"
         size_mb: ${KOPIA_CACHE_SIZE}
+      performance:
+        upload_bwlimit: \"${KOPIA_BWLIMIT}\"
       encryption:
         enabled: true
-        password: \"\""
+        password: \"${KOPIA_PASSWORD}\""
         
         echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
     fi
