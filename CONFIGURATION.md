@@ -56,7 +56,14 @@ borg:
     workers: 1
     upload_bwlimit: "50M"
     stale_worker_minutes: 5
+    rsync_delete: false  # SECURITY: Never sync local deletions to remote
+    remote_retention_days: 0  # 0 = disabled (recommended for append-only SSH)
 ```
+
+**Security Notes:**
+- `rsync_delete: false` (default) - Protects against malicious/accidental local deletions being synced to remote
+- `remote_retention_days: 0` (default) - Disables automatic remote cleanup (recommended for append-only SSH access)
+- For full SSH access, set `remote_retention_days: 7` to auto-delete orphaned remote backups after 7 days
 
 ### Kopia Settings
 
