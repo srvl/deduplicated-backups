@@ -164,6 +164,108 @@ migrate_legacy_config() {
     echo -e "  ${CYAN}  Sync mode: ${LEGACY_SYNC_MODE}${NC}"
 }
 
+# Extract existing config values for upgrade/rewrite scenarios
+# Sets global variables with OLD_ prefix that can be used as defaults
+extract_config_values() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}Extracting values from existing config...${NC}"
+
+    # Helper function to extract YAML values using grep/sed (no yq dependency)
+    # Usage: OLD_VAR=$(yaml_extract "key.subkey.value")
+    yaml_extract() {
+        local key="$1"
+        local result=""
+        # Try simple grep for flat keys first
+        if echo "$key" | grep -q "\."; then
+            # Nested key - need more complex extraction
+            local last_key=$(echo "$key" | rev | cut -d'.' -f1 | rev)
+            result=$(grep -E "^\s*${last_key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*:\s*//' | tr -d '"' | tr -d "'" | xargs)
+        else
+            result=$(grep -E "^${key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*:\s*//' | tr -d '"' | tr -d "'" | xargs)
+        fi
+        echo "$result"
+    }
+
+    # Core Wings settings (MUST preserve)
+    OLD_TOKEN=$(grep -E "^token:" "$CONFIG_FILE" 2>/dev/null | sed 's/token:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_TOKEN_ID=$(grep -E "^token_id:" "$CONFIG_FILE" 2>/dev/null | sed 's/token_id:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_DEBUG=$(grep -E "^debug:" "$CONFIG_FILE" 2>/dev/null | sed 's/debug:\s*//' | xargs || echo "false")
+    OLD_API_HOST=$(grep -E "^\s*host:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*host:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_API_PORT=$(grep -E "^\s*port:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*port:\s*//' | xargs || echo "8080")
+    OLD_API_SSL_CERT=$(grep -E "^\s*ssl_cert:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssl_cert:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_API_SSL_KEY=$(grep -E "^\s*ssl_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssl_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_REMOTE_QUERY=$(grep -E "^\s*remote:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*remote:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "https://localhost")
+
+    # License
+    OLD_LICENSE_KEY=$(grep -E "^\s*license_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*license_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+
+    # Backend selection
+    OLD_BACKEND=$(grep -E "^\s*backend:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*backend:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "borg")
+    OLD_STORAGE_MODE=$(grep -E "^\s*storage_mode:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*storage_mode:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "local")
+
+    # Borg settings
+    OLD_BORG_ENABLED=$(grep -E "^\s*enabled:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*enabled:\s*//' | xargs || echo "true")
+    OLD_BORG_LOCAL_REPO=$(grep -E "^\s*local_repository:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*local_repository:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_BORG_COMPRESSION=$(grep -E "^\s*compression:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*compression:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "lz4")
+    
+    # Borg encryption
+    OLD_BORG_ENCRYPT_ENABLED=$(grep -A5 "encryption:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*enabled:" | head -1 | sed 's/.*enabled:\s*//' | xargs || echo "false")
+    OLD_BORG_PASSPHRASE=$(grep -E "^\s*passphrase:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*passphrase:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+
+    # Borg remote config
+    OLD_REMOTE_REPO=$(grep -E "^\s*repository:" "$CONFIG_FILE" 2>/dev/null | tail -1 | sed 's/.*repository:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_SSH_KEY=$(grep -E "^\s*ssh_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssh_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_SSH_PORT=$(grep -E "^\s*ssh_port:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssh_port:\s*//' | xargs || echo "23")
+    OLD_REMOTE_BORG_PATH=$(grep -E "^\s*borg_path:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*borg_path:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "borg-1.4")
+
+    # Sync settings
+    OLD_SYNC_MODE=$(grep -A10 "sync:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*mode:" | head -1 | sed 's/.*mode:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "rsync")
+    OLD_SYNC_WORKERS=$(grep -E "^\s*workers:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*workers:\s*//' | xargs || echo "1")
+    OLD_SYNC_BWLIMIT=$(grep -E "^\s*upload_bwlimit:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*upload_bwlimit:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "50M")
+    OLD_SYNC_BATCH_DELAY=$(grep -E "^\s*batch_delay_seconds:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*batch_delay_seconds:\s*//' | xargs || echo "10")
+    OLD_SYNC_TIMEOUT=$(grep -E "^\s*timeout_hours:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*timeout_hours:\s*//' | xargs || echo "4")
+    OLD_SYNC_LOCK_WAIT=$(grep -E "^\s*lock_wait_seconds:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*lock_wait_seconds:\s*//' | xargs || echo "300")
+    OLD_RSYNC_SSH_KEY=$(grep -E "^\s*rsync_ssh_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*rsync_ssh_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_RSYNC_DELETE=$(grep -E "^\s*rsync_delete:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*rsync_delete:\s*//' | xargs || echo "false")
+    OLD_RSYNC_CONCURRENCY=$(grep -E "^\s*rsync_concurrency:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*rsync_concurrency:\s*//' | xargs || echo "4")
+    OLD_REMOTE_RETENTION=$(grep -E "^\s*remote_retention_days:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*remote_retention_days:\s*//' | xargs || echo "0")
+    OLD_STALE_WORKER_MINS=$(grep -E "^\s*stale_worker_minutes:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*stale_worker_minutes:\s*//' | xargs || echo "5")
+
+    # DRC settings
+    OLD_DRC_ENABLED=$(grep -A5 "drc:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*enabled:" | head -1 | sed 's/.*enabled:\s*//' | xargs || echo "false")
+    OLD_DRC_PASSWORD=$(grep -E "^\s*password:" "$CONFIG_FILE" 2>/dev/null | tail -1 | sed 's/.*password:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_DOWNLOAD_BWLIMIT=$(grep -E "^\s*download_bwlimit:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*download_bwlimit:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "50M")
+
+    # Discord webhook
+    OLD_DISCORD_WEBHOOK=$(grep -E "^\s*discord_webhook:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*discord_webhook:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+
+    # Kopia settings (for S3 backends)
+    OLD_S3_ENDPOINT=$(grep -E "^\s*endpoint:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*endpoint:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_S3_REGION=$(grep -E "^\s*region:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*region:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_S3_BUCKET=$(grep -E "^\s*bucket:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*bucket:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_S3_ACCESS_KEY=$(grep -E "^\s*access_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*access_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_S3_SECRET_KEY=$(grep -E "^\s*secret_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*secret_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+    OLD_KOPIA_CACHE=$(grep -E "^\s*path:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*path:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "/var/lib/pterodactyl/backups/kopia-cache")
+    OLD_KOPIA_CACHE_SIZE=$(grep -E "^\s*size_mb:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*size_mb:\s*//' | xargs || echo "5000")
+    OLD_KOPIA_PASSWORD=$(grep -A5 "encryption:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*password:" | head -1 | sed 's/.*password:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
+
+    echo -e "  ${GREEN}✓${NC} Existing values extracted"
+    
+    # Show what was found
+    if [ -n "$OLD_TOKEN" ]; then
+        echo -e "  ${CYAN}  Token: ${OLD_TOKEN:0:10}...${NC}"
+    fi
+    if [ -n "$OLD_LICENSE_KEY" ]; then
+        echo -e "  ${CYAN}  License: ${OLD_LICENSE_KEY:0:10}...${NC}"
+    fi
+    if [ -n "$OLD_REMOTE_REPO" ]; then
+        echo -e "  ${CYAN}  Remote: ${OLD_REMOTE_REPO}${NC}"
+    fi
+}
+
 # --- Core Installation Logic ---
 
 install_wings_dedup() {
@@ -298,6 +400,9 @@ install_wings_dedup() {
         cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
         echo -e "  ${GREEN}✓${NC} Backup created"
         
+        # Extract existing values to use as defaults
+        extract_config_values
+        
         echo ""
         echo -e "  ${YELLOW}Do you want to re-run the panel auto-deploy command?${NC}"
         read -p "  Re-configure from panel? [y/N] " -n 1 -r
@@ -357,12 +462,17 @@ install_wings_dedup() {
     echo -e "  ${CYAN}── License ──${NC}"
     echo -e "  ${YELLOW}  Format: alphanumeric with optional hyphens (e.g., abc123-def456)${NC}"
     while true; do
-        prompt_required "  License Key: " LICENSE_KEY
+        if [ -n "$OLD_LICENSE_KEY" ]; then
+            prompt_with_default "  License Key" "$OLD_LICENSE_KEY" LICENSE_KEY
+        else
+            prompt_required "  License Key: " LICENSE_KEY
+        fi
         # Validate license key format (letters, numbers, hyphens, 10-50 chars)
         if [[ "$LICENSE_KEY" =~ ^[a-zA-Z0-9-]{10,50}$ ]]; then
             break
         else
             echo -e "  ${RED}  ✗ Invalid format. Must be 10-50 alphanumeric characters (hyphens allowed).${NC}"
+            OLD_LICENSE_KEY=""  # Clear so next iteration uses prompt_required
         fi
     done
     echo ""
@@ -418,17 +528,56 @@ install_wings_dedup() {
     # Backend-specific settings
     if [[ "$BACKUP_BACKEND" == "borg" ]]; then
         echo -e "  ${CYAN}── Borg Configuration ──${NC}"
-        prompt_with_default "  Local Repository Path" "$DEFAULT_BORG_REPO" BORG_REPO
+        
+        # Local repository only needed for local and hybrid modes
+        if [[ "$STORAGE_MODE" != "remote" ]]; then
+            local_repo_default="${OLD_BORG_LOCAL_REPO:-$DEFAULT_BORG_REPO}"
+            prompt_with_default "  Local Repository Path" "$local_repo_default" BORG_REPO
+        fi
         
         if [[ "$STORAGE_MODE" != "local" ]]; then
             echo ""
             echo -e "  ${YELLOW}  Remote SSH storage (e.g., Hetzner Storage Box)${NC}"
             echo -e "  ${YELLOW}  Format: ssh://user@host:port/./path or user@host:path${NC}"
-            prompt_optional "  Remote Repository: " REMOTE_REPO
-            if [ -n "$REMOTE_REPO" ]; then
-                prompt_with_default "  SSH Port" "23" SSH_PORT
-                prompt_with_default "  SSH Key Path" "/root/.ssh/id_ed25519" SSH_KEY
-                prompt_with_default "  Remote Borg Path" "borg-1.4" REMOTE_BORG_PATH
+            
+            # Remote repository - use OLD_ value as default if available
+            if [ -n "$OLD_REMOTE_REPO" ]; then
+                prompt_with_default "  Remote Repository" "$OLD_REMOTE_REPO" REMOTE_REPO
+            else
+                prompt_required "  Remote Repository: " REMOTE_REPO
+            fi
+            
+            ssh_port_default="${OLD_SSH_PORT:-23}"
+            ssh_key_default="${OLD_SSH_KEY:-/root/.ssh/id_ed25519}"
+            borg_path_default="${OLD_REMOTE_BORG_PATH:-borg-1.4}"
+            
+            prompt_with_default "  SSH Port" "$ssh_port_default" SSH_PORT
+            prompt_with_default "  SSH Key Path" "$ssh_key_default" SSH_KEY
+            prompt_with_default "  Remote Borg Path" "$borg_path_default" REMOTE_BORG_PATH
+            
+            if [[ "$STORAGE_MODE" == "hybrid" ]]; then
+                echo ""
+                echo -e "  ${CYAN}── Sync Settings ──${NC}"
+                
+                bwlimit_default="${OLD_SYNC_BWLIMIT:-50M}"
+                batch_delay_default="${OLD_SYNC_BATCH_DELAY:-10}"
+                timeout_default="${OLD_SYNC_TIMEOUT:-4}"
+                lock_wait_default="${OLD_SYNC_LOCK_WAIT:-300}"
+                
+                prompt_with_default "  Upload Bandwidth Limit" "$bwlimit_default" SYNC_BWLIMIT
+                prompt_with_default "  Sync Batch Delay (seconds)" "$batch_delay_default" SYNC_BATCH_DELAY
+                prompt_with_default "  Sync Timeout (hours)" "$timeout_default" SYNC_TIMEOUT_HOURS
+                prompt_with_default "  Lock Wait (seconds)" "$lock_wait_default" SYNC_LOCK_WAIT
+                
+                echo ""
+                echo -e "  ${YELLOW}  Some providers (Hetzner Storage Box) use separate SSH keys for${NC}"
+                echo -e "  ${YELLOW}  borg-serve vs rsync/SFTP access. Leave blank if same key works for both.${NC}"
+                rsync_key_default="${OLD_RSYNC_SSH_KEY:-}"
+                if [ -n "$rsync_key_default" ]; then
+                    prompt_with_default "  Rsync SSH Key (optional)" "$rsync_key_default" RSYNC_SSH_KEY
+                else
+                    prompt_optional "  Rsync SSH Key (optional, if different from borg key): " RSYNC_SSH_KEY
+                fi
             fi
         fi
     else
@@ -466,6 +615,9 @@ install_wings_dedup() {
     echo -e "  ${CYAN}── Discord Notifications (Optional) ──${NC}"
     echo -e "  ${YELLOW}  Leave blank to skip Discord notifications${NC}"
     prompt_optional "  Discord Webhook URL: " DISCORD_WEBHOOK
+    if [ -n "$DISCORD_WEBHOOK" ]; then
+        echo -e "  ${GREEN}✓${NC} Webhook URL captured"
+    fi
     echo ""
 
     echo -e "  ${GREEN}✓${NC} Settings collected"
@@ -581,9 +733,9 @@ KOPIAEOF
     fi
     
     # Create directories based on backend
-    if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+    if [[ "$BACKUP_BACKEND" == "borg" ]] && [ -n "$BORG_REPO" ]; then
         mkdir -p "$BORG_REPO"
-    else
+    elif [[ "$BACKUP_BACKEND" == "kopia" ]]; then
         mkdir -p "$KOPIA_CACHE"
     fi
 
@@ -610,30 +762,63 @@ EOF
 
 # Build the backup config block based on selections
     if [[ "$BACKUP_BACKEND" == "borg" ]]; then
+        # Start the borg config block
         BACKUP_CONFIG="
 # Wings-Dedup Backup Configuration
 backups:
   backend: \"${BACKUP_BACKEND}\"
   storage_mode: \"${STORAGE_MODE}\"
   borg:
-    enabled: true
-    local_repository: \"${BORG_REPO}\"
+    enabled: true"
+        
+        # Add local_repository if we have one (local and hybrid modes)
+        if [ -n "$BORG_REPO" ]; then
+            BACKUP_CONFIG+="
+    local_repository: \"${BORG_REPO}\""
+        fi
+        
+        # Add compression and encryption
+        BACKUP_CONFIG+="
     compression: lz4
     encryption:
       enabled: false"
         
-        # Add remote config if provided
+        # Add remote config for remote and hybrid modes
         if [ -n "$REMOTE_REPO" ]; then
             BACKUP_CONFIG+="
     remote:
       repository: \"${REMOTE_REPO}\"
       ssh_key: \"${SSH_KEY}\"
       ssh_port: ${SSH_PORT}
-      borg_path: \"${REMOTE_BORG_PATH}\"
+      borg_path: \"${REMOTE_BORG_PATH}\""
+            
+            # Add sync config for hybrid mode
+            if [[ "$STORAGE_MODE" == "hybrid" ]]; then
+                SYNC_BWLIMIT="${SYNC_BWLIMIT:-50M}"
+                SYNC_BATCH_DELAY="${SYNC_BATCH_DELAY:-10}"
+                SYNC_TIMEOUT_HOURS="${SYNC_TIMEOUT_HOURS:-4}"
+                SYNC_LOCK_WAIT="${SYNC_LOCK_WAIT:-300}"
+                
+                BACKUP_CONFIG+="
     sync:
       mode: rsync
       workers: 1
-      upload_bwlimit: \"50M\""
+      batch_delay_seconds: ${SYNC_BATCH_DELAY}
+      upload_bwlimit: \"${SYNC_BWLIMIT}\"
+      timeout_hours: ${SYNC_TIMEOUT_HOURS}
+      lock_wait_seconds: ${SYNC_LOCK_WAIT}"
+                
+                # Add rsync_ssh_key if provided
+                if [ -n "$RSYNC_SSH_KEY" ]; then
+                    BACKUP_CONFIG+="
+      rsync_ssh_key: \"${RSYNC_SSH_KEY}\""
+                fi
+                
+                BACKUP_CONFIG+="
+      rsync_delete: false
+      remote_retention_days: 0
+      stale_worker_minutes: 5"
+            fi
         fi
         
         echo -e "  ${GREEN}✓${NC} Borg backup configured (${STORAGE_MODE} mode)"
@@ -663,6 +848,17 @@ backups:
       password: \"${KOPIA_PASSWORD}\""
         
         echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
+    fi
+    
+    # Add DRC (Disaster Recovery Console) config if we have a remote repo
+    # DRC fetches backup list from remote, so useful for both remote and hybrid modes
+    if [ -n "$REMOTE_REPO" ]; then
+        BACKUP_CONFIG+="
+  drc:
+    enabled: true
+    access_path: \"/admin/drc\"
+    download_bwlimit: \"50M\""
+        echo -e "  ${GREEN}✓${NC} Disaster Recovery Console enabled at /admin/drc"
     fi
     
     # Add notifications if webhook provided
@@ -801,9 +997,9 @@ uninstall_wings_dedup() {
     if [ -f "$CONFIG_FILE" ]; then
         # Remove Wings-Dedup specific sections
         sed -i '/# Wings-Dedup License/,/license_key:/d' "$CONFIG_FILE" 2>/dev/null || true
-        sed -i '/# Borg Backup Configuration/,/compression:/d' "$CONFIG_FILE" 2>/dev/null || true
+        sed -i '/# Wings-Dedup Backup Configuration/,/^[a-z]/d' "$CONFIG_FILE" 2>/dev/null || true
         echo -e "  ${GREEN}✓${NC} Wings-Dedup settings removed"
-        echo -e "  ${YELLOW}Note: Borg repository data was NOT deleted${NC}"
+        echo -e "  ${YELLOW}Note: Borg/Kopia repository data was NOT deleted${NC}"
     fi
 
     systemctl daemon-reload
