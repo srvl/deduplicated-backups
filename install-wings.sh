@@ -1160,7 +1160,7 @@ update_only() {
 
 update_config_only() {
     echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}${BOLD}            Wings-Dedup Config Updater                         ${NC}"
+    echo -e "${BLUE}${BOLD}            Wings-Dedup Config Viewer/Editor                    ${NC}"
     echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
 
@@ -1172,48 +1172,68 @@ update_config_only() {
         return 1
     fi
     
-    echo -e "${CYAN}[Step 1/3] Reading Existing Configuration${NC}"
+    echo -e "${CYAN}[Step 1/2] Current Configuration${NC}"
+    echo ""
     
-    # Extract existing values (same logic as in install_wings_dedup)
+    # Extract and display current values
     extract_config_values
     
-    echo -e "  ${GREEN}✓${NC} Existing values extracted"
+    echo -e "  ${GREEN}✓${NC} Current settings:"
+    echo -e "    Token: ${CYAN}${OLD_TOKEN:0:15}...${NC}"
+    [ -n "$OLD_LICENSE_KEY" ] && echo -e "    License: ${CYAN}${OLD_LICENSE_KEY:0:15}...${NC}"
+    [ -n "$OLD_REMOTE_REPO" ] && echo -e "    Remote Repo: ${CYAN}$OLD_REMOTE_REPO${NC}"
+    [ -n "$OLD_SSH_PORT" ] && echo -e "    SSH Port: ${CYAN}$OLD_SSH_PORT${NC}"
+    [ -n "$OLD_SYNC_BWLIMIT" ] && echo -e "    Bandwidth Limit: ${CYAN}$OLD_SYNC_BWLIMIT${NC}"
+    [ -n "$OLD_SYNC_TIMEOUT" ] && echo -e "    Sync Timeout: ${CYAN}${OLD_SYNC_TIMEOUT}h${NC}"
+    [ -n "$OLD_DRC_ENABLED" ] && echo -e "    DRC Enabled: ${CYAN}$OLD_DRC_ENABLED${NC}"
+    [ -n "$OLD_DRC_PORT" ] && echo -e "    DRC Port: ${CYAN}$OLD_DRC_PORT${NC}"
     echo ""
     
-    # Backup existing config
-    BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp "$CONFIG_FILE" "$BACKUP_FILE"
-    echo -e "  ${GREEN}✓${NC} Backup created: ${CYAN}$BACKUP_FILE${NC}"
+    echo -e "${CYAN}[Step 2/2] Edit Configuration${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Choose an option:${NC}"
+    echo -e "    ${GREEN}1)${NC} Open config in nano (manual edit)"
+    echo -e "    ${CYAN}2)${NC} Re-run full setup (option 1 - preserves values as defaults)"
+    echo -e "    ${RED}3)${NC} Cancel"
     echo ""
     
-    echo -e "${CYAN}[Step 2/3] Update Configuration${NC}"
-    echo ""
+    read -p "  Choice [1-3]: " -r EDIT_CHOICE
     
-    # Re-run the dedup-specific configuration prompts
-    configure_wings_dedup
-    
-    echo ""
-    echo -e "${CYAN}[Step 3/3] Restart Wings${NC}"
-    
-    read -p "Restart Wings now to apply changes? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        systemctl restart wings
-        sleep 2
-        if systemctl is-active --quiet wings; then
-            echo -e "  ${GREEN}✓${NC} Wings restarted successfully"
-        else
-            echo -e "  ${RED}✗${NC} Wings failed to start"
-            echo -e "  ${YELLOW}Check: journalctl -u wings -e${NC}"
-        fi
-    fi
-    
-    echo ""
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}✓ Config Update Complete!${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
-    trap '' EXIT
-    exit 0
+    case "$EDIT_CHOICE" in
+        1)
+            # Backup before editing
+            BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+            cp "$CONFIG_FILE" "$BACKUP_FILE"
+            echo -e "  ${GREEN}✓${NC} Backup created: ${CYAN}$BACKUP_FILE${NC}"
+            
+            nano "$CONFIG_FILE"
+            
+            echo ""
+            read -p "Restart Wings to apply changes? [Y/n] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                systemctl restart wings
+                sleep 2
+                if systemctl is-active --quiet wings; then
+                    echo -e "  ${GREEN}✓${NC} Wings restarted successfully"
+                else
+                    echo -e "  ${RED}✗${NC} Wings failed to start"
+                    echo -e "  ${YELLOW}Check: journalctl -u wings -e${NC}"
+                    echo -e "  ${YELLOW}Restore backup: cp $BACKUP_FILE $CONFIG_FILE${NC}"
+                fi
+            fi
+            ;;
+        2)
+            echo ""
+            install_wings_dedup
+            ;;
+        3)
+            echo -e "  ${YELLOW}Cancelled${NC}"
+            ;;
+        *)
+            echo -e "  ${RED}Invalid choice${NC}"
+            ;;
+    esac
 }
 
 # --- Main Menu ---
