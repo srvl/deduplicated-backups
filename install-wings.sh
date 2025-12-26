@@ -1156,6 +1156,66 @@ update_only() {
     exit 0
 }
 
+# --- Config Update Only Logic ---
+
+update_config_only() {
+    echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}${BOLD}            Wings-Dedup Config Updater                         ${NC}"
+    echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    CONFIG_FILE="/etc/pterodactyl/config.yml"
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}Error: No config.yml found at $CONFIG_FILE${NC}"
+        echo -e "${YELLOW}Run option 1 for full installation first.${NC}"
+        return 1
+    fi
+    
+    echo -e "${CYAN}[Step 1/3] Reading Existing Configuration${NC}"
+    
+    # Extract existing values (same logic as in install_wings_dedup)
+    extract_config_values
+    
+    echo -e "  ${GREEN}✓${NC} Existing values extracted"
+    echo ""
+    
+    # Backup existing config
+    BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$CONFIG_FILE" "$BACKUP_FILE"
+    echo -e "  ${GREEN}✓${NC} Backup created: ${CYAN}$BACKUP_FILE${NC}"
+    echo ""
+    
+    echo -e "${CYAN}[Step 2/3] Update Configuration${NC}"
+    echo ""
+    
+    # Re-run the dedup-specific configuration prompts
+    configure_wings_dedup
+    
+    echo ""
+    echo -e "${CYAN}[Step 3/3] Restart Wings${NC}"
+    
+    read -p "Restart Wings now to apply changes? [Y/n] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        systemctl restart wings
+        sleep 2
+        if systemctl is-active --quiet wings; then
+            echo -e "  ${GREEN}✓${NC} Wings restarted successfully"
+        else
+            echo -e "  ${RED}✗${NC} Wings failed to start"
+            echo -e "  ${YELLOW}Check: journalctl -u wings -e${NC}"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}✓ Config Update Complete!${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    trap '' EXIT
+    exit 0
+}
+
 # --- Main Menu ---
 
 main_menu() {
@@ -1175,17 +1235,19 @@ main_menu() {
         echo -e "${BOLD}Select an option:${NC}"
         echo -e "  ${GREEN}1)${NC} Install/Update Wings-Dedup (Full Setup)"
         echo -e "  ${CYAN}2)${NC} Update Only (Binary replacement, no config)"
-        echo -e "  ${RED}3)${NC} Uninstall/Restore Original Wings"
-        echo -e "  ${YELLOW}4)${NC} Exit"
+        echo -e "  ${BLUE}3)${NC} Update Config Only (Re-run config prompts)"
+        echo -e "  ${RED}4)${NC} Uninstall/Restore Original Wings"
+        echo -e "  ${YELLOW}5)${NC} Exit"
         echo ""
         
-        read -p "Choice (1-4): " -r CHOICE
+        read -p "Choice (1-5): " -r CHOICE
 
         case "$CHOICE" in
             1) echo ""; install_wings_dedup ;;
             2) echo ""; update_only ;;
-            3) echo ""; uninstall_wings_dedup ;;
-            4) echo -e "\n${BLUE}Goodbye!${NC}"; exit 0 ;;
+            3) echo ""; update_config_only ;;
+            4) echo ""; uninstall_wings_dedup ;;
+            5) echo -e "\n${BLUE}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "\n${RED}Invalid choice${NC}" ;;
         esac
         echo ""
