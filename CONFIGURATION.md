@@ -83,7 +83,7 @@ system:
 
 ---
 
-### Hybrid (Borg with rsync)
+### Hybrid (Borg with Remote Sync)
 
 **RECOMMENDED** - Backups stored locally first, then synced to remote in background.
 
@@ -106,20 +106,16 @@ system:
         borg_path: "borg-1.4"
       
       sync:
-        mode: "rsync"                  # "rsync" recommended
+        mode: "native"                 # "native" (recommended) or "rsync"
         workers: 1
-        batch_delay_seconds: 10        # Wait before syncing (batches backups)
         upload_bwlimit: "50M"          # Limit upload speed (MB/s)
         timeout_hours: 4               # Max sync time
         lock_wait_seconds: 300         # Borg lock wait
-        rsync_ssh_key: ""              # Optional: separate key for rsync
-        rsync_delete: false            # DANGER: never sync deletions
-        remote_retention_days: 0       # 0 = disabled (recommended)
 ```
 
 **How it works:**
 1. Backup completes instantly to local repo
-2. Background worker syncs to remote using rsync
+2. Archive is synced to remote via borg export-tar/import-tar (native mode)
 3. Admin dashboard shows sync status at `/drc`
 
 **Pros:** Fast local backups + disaster recovery  
@@ -168,19 +164,86 @@ borg:
 ```yaml
 borg:
   sync:
-    mode: "rsync"                  # "rsync" or "export-tar"
+    mode: "native"                 # "native" (recommended) or "rsync" (legacy)
     workers: 1                     # Number of sync workers
-    batch_delay_seconds: 10        # Wait before syncing
     upload_bwlimit: "50M"          # Upload speed limit
     timeout_hours: 4               # Max sync operation time
     lock_wait_seconds: 300         # Borg lock wait time
+    # Rsync-specific options (only when mode: "rsync")
+    batch_delay_seconds: 10        # Wait before syncing
     rsync_ssh_key: ""              # Optional separate key for rsync
     rsync_delete: false            # DANGER: sync local deletions to remote
     remote_retention_days: 0       # Days before cleaning remote orphans (0=disabled)
     stale_worker_minutes: 5        # Alert threshold for stuck workers
 ```
 
+### Sync Mode: Native vs Rsync
+
+Choose your sync mode based on your use case:
+
+#### Native Mode (Recommended)
+```yaml
+borg:
+  sync:
+    mode: "native"
+```
+
+**How it works:** Each archive is exported via `borg export-tar`, streamed over SSH, and imported to remote via `borg import-tar`.
+
+| Pros | Cons |
+|------|------|
+| ✅ No cache conflicts | ❌ Cannot resume interrupted syncs |
+| ✅ Immediate sync after backup | ❌ Full archive re-transfer on failure |
+| ✅ Works with restricted SSH (borg-serve) | ❌ Slightly slower for very large archives |
+| ✅ Dedup preserved on both ends | |
+
+**Best for:** Most users, Hetzner Storage Box, any provider supporting borg-serve.
+
+---
+
+#### Rsync Mode (Legacy)
+```yaml
+borg:
+  sync:
+    mode: "rsync"
+    rsync_ssh_key: "/root/.ssh/storagebox_rsync"  # May need separate key
+```
+
+**How it works:** The entire local borg repository directory is synced to remote using rsync.
+
+| Pros | Cons |
+|------|------|
+| ✅ Can resume interrupted transfers | ❌ "Cache is newer" errors possible |
+| ✅ Efficient for incremental changes | ❌ Requires SFTP/rsync SSH access |
+| ✅ Familiar rsync semantics | ❌ May sync incomplete data if backup in progress |
+| | ❌ Scans entire repo (slow for large repos) |
+
+**Best for:** Very large repos (500GB+) where resume capability matters, or providers without borg-serve support.
+
 > **Important:** If your storage provider (e.g., Hetzner Storage Box) uses **different SSH keys** for borg-serve mode vs SFTP/rsync access, set `rsync_ssh_key` to the SFTP key path.
+
+### Maintenance Settings
+
+Configure automated maintenance tasks:
+
+```yaml
+system:
+  maintenance:
+    orphan_cleanup_enabled: true      # Remove backups for deleted servers
+    orphan_cleanup_schedule: "0 3 * * *"  # Cron: 3 AM daily (also runs compact)
+    check_on_startup: false           # Run borg check at startup (slow for large repos)
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `orphan_cleanup_enabled` | `true` | Automatically cleanup backups for deleted servers |
+| `orphan_cleanup_schedule` | `0 3 * * *` | Cron expression for cleanup + compact job |
+| `check_on_startup` | `false` | Run borg check when Wings starts |
+
+**Manual Prune:** You can trigger maintenance manually from the Panel addon's "Prune Backups" button, or via API:
+```bash
+curl -X POST -H "Authorization: Bearer <wings-token>" https://your-node:8591/api/admin/backups/prune
+```
 
 ---
 

@@ -43,7 +43,7 @@ system:
         ssh_key: "/root/.ssh/id_ed25519"
         ssh_port: 23
       sync:
-        mode: "rsync"
+        mode: "native"
         upload_bwlimit: "50M"
 ```
 

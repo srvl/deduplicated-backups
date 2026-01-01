@@ -871,32 +871,48 @@ backups:
         echo -e "  ${YELLOW}○${NC} Discord webhook skipped"
     fi
 
-    # Append to config file if system section exists, otherwise create it
+    # Remove any existing Wings-Dedup config sections to avoid duplicates/conflicts
+    # This ensures clean config regardless of how many times script is run
+    if [ -f "$CONFIG_FILE" ]; then
+        # Remove previous Wings-Dedup license and backup config if they exist
+        # by creating a temporary file without them
+        sed -i '/^# Wings-Dedup/d' "$CONFIG_FILE" 2>/dev/null || true
+        sed -i '/^license:/,/^[a-z_]*:/{ /^[a-z_]*:/!d; /^license:/d; }' "$CONFIG_FILE" 2>/dev/null || true
+        # Remove orphaned backups section under system if it exists
+        sed -i '/^  backups:/,/^  [a-z_]*:/{ /^  [a-z_]*:/!d; /^  backups:/d; }' "$CONFIG_FILE" 2>/dev/null || true
+        
+        # Remove trailing blank lines
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$CONFIG_FILE" 2>/dev/null || true
+    fi
+
+    # Append license config
+    cat >> "$CONFIG_FILE" <<EOF
+
+# Wings-Dedup License
+license:
+  license_key: "${LICENSE_KEY}"
+EOF
+
+    # Append backup config - must go under system: which panel auto-deploy creates
     if grep -q "^system:" "$CONFIG_FILE" 2>/dev/null; then
-        if grep -q "^  backups:" "$CONFIG_FILE" 2>/dev/null; then
-            # Remove old backups section and replace
-            # This is complex with sed, so we'll append and warn
-            echo -e "  ${YELLOW}Note: Existing backups section preserved. Review config.yml to merge settings.${NC}"
-            cat >> "$CONFIG_FILE" <<EOF
-${BACKUP_CONFIG}
-EOF
-        else
-            # Insert after system:
-            sed -i "/^system:/a\\${BACKUP_CONFIG}" "$CONFIG_FILE" 2>/dev/null || \
-            cat >> "$CONFIG_FILE" <<EOF
-${BACKUP_CONFIG}
-EOF
-        fi
-    else
+        # system: exists, append backups config (already has proper 2-space indentation)
         cat >> "$CONFIG_FILE" <<EOF
 
+# Wings-Dedup Backup Configuration
+${BACKUP_CONFIG}
+EOF
+    else
+        # system: doesn't exist (shouldn't happen if panel auto-deploy ran)
+        cat >> "$CONFIG_FILE" <<EOF
+
+# Wings-Dedup Backup Configuration
 system:
 ${BACKUP_CONFIG}
 EOF
     fi
 
     chmod 600 "$CONFIG_FILE"
-    echo -e "  ${GREEN}✓${NC} Config permissions secured"
+    echo -e "  ${GREEN}✓${NC} Config saved and permissions secured"
 
     # Create systemd service
     cat > /etc/systemd/system/wings.service <<'EOF'
