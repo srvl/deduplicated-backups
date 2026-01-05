@@ -75,7 +75,7 @@ system:
         repository: "ssh://u123456@u123456.your-storagebox.de:23/./borg-repo"
         ssh_key: "/root/.ssh/id_ed25519"
         ssh_port: 23
-        borg_path: "borg-1.4"
+        borg_path: "borg"
 ```
 
 **Pros:** Offsite backups, survives node failure  
@@ -103,7 +103,7 @@ system:
         repository: "ssh://u123456@u123456.your-storagebox.de:23/./borg-repo"
         ssh_key: "/root/.ssh/id_ed25519"    # For borg operations
         ssh_port: 23
-        borg_path: "borg-1.4"
+        borg_path: "borg"
       
       sync:
         mode: "native"                 # "native" (recommended) or "rsync"
@@ -157,7 +157,7 @@ borg:
     repository: "ssh://user@host:port/./path"
     ssh_key: "/root/.ssh/id_ed25519"
     ssh_port: 23
-    borg_path: "borg-1.4"
+    borg_path: "borg"
 ```
 
 #### Sync Settings (Hybrid mode)
@@ -387,7 +387,109 @@ curl -X POST http://localhost:8591/drc/api/sync/reset-circuit-breaker
 
 ---
 
+
+## Complete Modern Configuration Example
+
+Here is a full `backups` configuration block with all modern settings and no legacy fields. You can copy this into your `config.yml` under the `system` block.
+
+```yaml
+system:
+  backups:
+    write_limit: 0
+    compression_level: "best_speed"
+    
+    # Backend: "borg" (recommended) or "kopia"
+    backend: "borg"
+    
+    # Storage Mode: "local", "remote", or "hybrid"
+    storage_mode: "hybrid"
+
+    # Borg Configuration (when backend is "borg")
+    borg:
+      local_repository: "/var/lib/pterodactyl/backups/borg"
+      compression: "lz4"
+      
+      encryption:
+        enabled: true
+        passphrase: "change-me"
+        mode: "repokey-blake2"
+      
+      remote:
+        repository: "ssh://user@host:port/./path"
+        ssh_key: "/path/to/private/key"
+        ssh_port: 23
+        borg_path: "borg"
+      
+      sync:
+        mode: "native"
+        workers: 1
+        batch_delay_seconds: 10
+        upload_bwlimit: "50M"
+        timeout_hours: 4
+        lock_wait_seconds: 300
+        rsync_ssh_key: ""
+        remote_retention_days: 7
+        stale_worker_minutes: 5
+        rsync_concurrency: 4
+      
+      performance:
+        max_concurrent: 1
+        lock_timeout_seconds: 300
+        backup_timeout_minutes: 0
+        max_retries: 3
+        retry_delay_seconds: 10
+        chunk_params: "auto"
+        upload_buffer_mb: 100
+      
+      maintenance:
+        orphan_cleanup_enabled: true
+        orphan_cleanup_schedule: "0 3 * * *"
+        check_on_startup: false
+        panel_url: ""
+        panel_api_token: ""
+
+    # Kopia Configuration (when backend is "kopia")
+    kopia:
+      enabled: false
+      s3:
+        endpoint: ""
+        region: "us-east-1"
+        bucket: ""
+        prefix: "backups"
+        access_key: ""
+        secret_key: ""
+      cache:
+        enabled: true
+        path: "/var/lib/pterodactyl/backups/kopia-cache"
+        size_mb: 5000
+      encryption:
+        enabled: true
+        password: ""
+      performance:
+        parallel_uploads: 4
+        upload_bwlimit: "50M"
+
+    # Disaster Recovery Console
+    drc:
+      enabled: true
+      access_path: "/admin/drc"
+      download_bwlimit: "50M"
+      recovery_token: ""
+      discord_oauth:
+        enabled: false
+        client_id: ""
+        client_secret: ""
+        redirect_url: ""
+        allowed_user_ids: []
+
+    notifications:
+      discord_webhook: ""
+```
+
+---
+
 ## Legacy Configuration
+
 
 > **Note:** The `disaster_recovery` section under `borg` is deprecated but still supported for backwards compatibility. New installations should use the structure above.
 

@@ -125,7 +125,7 @@ migrate_legacy_config() {
 
     # Set defaults
     LEGACY_SSH_PORT="${LEGACY_SSH_PORT:-23}"
-    LEGACY_BORG_PATH="${LEGACY_BORG_PATH:-borg-1.4}"
+    LEGACY_BORG_PATH="${LEGACY_BORG_PATH:-borg}"
     LEGACY_SYNC_MODE="${LEGACY_SYNC_MODE:-rsync}"
     LEGACY_BW_LIMIT="${LEGACY_BW_LIMIT:-50M}"
 
@@ -219,7 +219,7 @@ extract_config_values() {
     OLD_REMOTE_REPO=$(grep -E "^\s*repository:" "$CONFIG_FILE" 2>/dev/null | tail -1 | sed 's/.*repository:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
     OLD_SSH_KEY=$(grep -E "^\s*ssh_key:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssh_key:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "")
     OLD_SSH_PORT=$(grep -E "^\s*ssh_port:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*ssh_port:\s*//' | xargs || echo "23")
-    OLD_REMOTE_BORG_PATH=$(grep -E "^\s*borg_path:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*borg_path:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "borg-1.4")
+    OLD_REMOTE_BORG_PATH=$(grep -E "^\s*borg_path:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*borg_path:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "borg")
 
     # Sync settings
     OLD_SYNC_MODE=$(grep -A10 "sync:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*mode:" | head -1 | sed 's/.*mode:\s*//' | tr -d '"' | tr -d "'" | xargs || echo "rsync")
@@ -549,7 +549,7 @@ install_wings_dedup() {
             
             ssh_port_default="${OLD_SSH_PORT:-23}"
             ssh_key_default="${OLD_SSH_KEY:-/root/.ssh/id_ed25519}"
-            borg_path_default="${OLD_REMOTE_BORG_PATH:-borg-1.4}"
+            borg_path_default="${OLD_REMOTE_BORG_PATH:-borg}"
             
             prompt_with_default "  SSH Port" "$ssh_port_default" SSH_PORT
             prompt_with_default "  SSH Key Path" "$ssh_key_default" SSH_KEY
