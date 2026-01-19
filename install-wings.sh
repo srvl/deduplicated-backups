@@ -665,30 +665,31 @@ install_wings_dedup() {
             echo -e "  ${YELLOW}Installing Kopia...${NC}"
             if command -v apt-get &> /dev/null; then
                 # Add Kopia repository for Debian/Ubuntu
-                curl -fsSL https://kopia.io/signing-key | gpg --dearmor -o /usr/share/keyrings/kopia-keyring.gpg 2>/dev/null || true
-                echo "deb [signed-by=/usr/share/keyrings/kopia-keyring.gpg] https://packages.kopia.io/apt/ stable main" > /etc/apt/sources.list.d/kopia.list
+                mkdir -p /etc/apt/keyrings
+                curl -s https://kopia.io/signing-key | gpg --dearmor -o /etc/apt/keyrings/kopia-keyring.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kopia-keyring.gpg] http://packages.kopia.io/apt/ stable main" | tee /etc/apt/sources.list.d/kopia.list
                 apt-get update -qq && apt-get install -y -qq kopia > /dev/null 2>&1
             elif command -v dnf &> /dev/null; then
                 # Add Kopia repository for Fedora
-                rpm --import https://kopia.io/signing-key 2>/dev/null || true
+                rpm --import https://kopia.io/signing-key
                 cat > /etc/yum.repos.d/kopia.repo << 'KOPIAEOF'
 [Kopia]
 name=Kopia
-baseurl=https://packages.kopia.io/rpm/stable/$basearch/
-enabled=1
+baseurl=http://packages.kopia.io/rpm/stable/$basearch/
 gpgcheck=1
+enabled=1
 gpgkey=https://kopia.io/signing-key
 KOPIAEOF
                 dnf install -y -q kopia > /dev/null 2>&1
             elif command -v yum &> /dev/null; then
                 # Add Kopia repository for RHEL/CentOS
-                rpm --import https://kopia.io/signing-key 2>/dev/null || true
+                rpm --import https://kopia.io/signing-key
                 cat > /etc/yum.repos.d/kopia.repo << 'KOPIAEOF'
 [Kopia]
 name=Kopia
-baseurl=https://packages.kopia.io/rpm/stable/$basearch/
-enabled=1
+baseurl=http://packages.kopia.io/rpm/stable/$basearch/
 gpgcheck=1
+enabled=1
 gpgkey=https://kopia.io/signing-key
 KOPIAEOF
                 yum install -y -q kopia > /dev/null 2>&1
