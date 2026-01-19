@@ -342,8 +342,16 @@ install_wings_dedup() {
         fi
     fi
     
-    if ! file ./wings | grep -qE "(executable|ELF)"; then
-        echo -e "  ${RED}✗ Invalid binary file${NC}"; exit 1;
+    # Validate binary is executable - try 'file' command first, fallback to execution test
+    if command -v file &> /dev/null; then
+        if ! file ./wings | grep -qE "(executable|ELF)"; then
+            echo -e "  ${RED}✗ Invalid binary file${NC}"; exit 1;
+        fi
+    else
+        # Fallback: try to execute the binary to verify it's valid
+        if ! ./wings --version &> /dev/null; then
+            echo -e "  ${RED}✗ Invalid binary file (cannot execute)${NC}"; exit 1;
+        fi
     fi
     NEW_VERSION=$(./wings --version 2>/dev/null | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
@@ -1291,4 +1299,3 @@ main_menu() {
 }
 
 main_menu "menu"
-
