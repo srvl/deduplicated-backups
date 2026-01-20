@@ -769,37 +769,38 @@ EOF
         echo -e "  ${YELLOW}Updating existing backup configuration...${NC}"
     fi
 
-# Build the backup config block based on selections
+    # Build the backup config block based on selections
+    # NOTE: Identation is critical. "backups" must be 2 spaces indented to sit under "system:"
+    # properties under backups must be 4 spaces, etc.
     if [[ "$BACKUP_BACKEND" == "borg" ]]; then
         # Start the borg config block
         BACKUP_CONFIG="
-# Wings-Dedup Backup Configuration
-backups:
-  backend: \"${BACKUP_BACKEND}\"
-  storage_mode: \"${STORAGE_MODE}\"
-  borg:
-    enabled: true"
+  backups:
+    backend: \"${BACKUP_BACKEND}\"
+    storage_mode: \"${STORAGE_MODE}\"
+    borg:
+      enabled: true"
         
         # Add local_repository if we have one (local and hybrid modes)
         if [ -n "$BORG_REPO" ]; then
             BACKUP_CONFIG+="
-    local_repository: \"${BORG_REPO}\""
+      local_repository: \"${BORG_REPO}\""
         fi
         
         # Add compression and encryption
         BACKUP_CONFIG+="
-    compression: lz4
-    encryption:
-      enabled: false"
+      compression: lz4
+      encryption:
+        enabled: false"
         
         # Add remote config for remote and hybrid modes
         if [ -n "$REMOTE_REPO" ]; then
             BACKUP_CONFIG+="
-    remote:
-      repository: \"${REMOTE_REPO}\"
-      ssh_key: \"${SSH_KEY}\"
-      ssh_port: ${SSH_PORT}
-      borg_path: \"${REMOTE_BORG_PATH}\""
+      remote:
+        repository: \"${REMOTE_REPO}\"
+        ssh_key: \"${SSH_KEY}\"
+        ssh_port: ${SSH_PORT}
+        borg_path: \"${REMOTE_BORG_PATH}\""
             
             # Add sync config for hybrid mode
             if [[ "$STORAGE_MODE" == "hybrid" ]]; then
@@ -809,24 +810,24 @@ backups:
                 SYNC_LOCK_WAIT="${SYNC_LOCK_WAIT:-300}"
                 
                 BACKUP_CONFIG+="
-    sync:
-      mode: rsync
-      workers: 1
-      batch_delay_seconds: ${SYNC_BATCH_DELAY}
-      upload_bwlimit: \"${SYNC_BWLIMIT}\"
-      timeout_hours: ${SYNC_TIMEOUT_HOURS}
-      lock_wait_seconds: ${SYNC_LOCK_WAIT}"
+      sync:
+        mode: rsync
+        workers: 1
+        batch_delay_seconds: ${SYNC_BATCH_DELAY}
+        upload_bwlimit: \"${SYNC_BWLIMIT}\"
+        timeout_hours: ${SYNC_TIMEOUT_HOURS}
+        lock_wait_seconds: ${SYNC_LOCK_WAIT}"
                 
                 # Add rsync_ssh_key if provided
                 if [ -n "$RSYNC_SSH_KEY" ]; then
                     BACKUP_CONFIG+="
-      rsync_ssh_key: \"${RSYNC_SSH_KEY}\""
+        rsync_ssh_key: \"${RSYNC_SSH_KEY}\""
                 fi
                 
                 BACKUP_CONFIG+="
-      rsync_delete: false
-      remote_retention_days: 0
-      stale_worker_minutes: 5"
+        rsync_delete: false
+        remote_retention_days: 0
+        stale_worker_minutes: 5"
             fi
         fi
         
@@ -834,27 +835,26 @@ backups:
     else
         # Kopia configuration
         BACKUP_CONFIG="
-# Wings-Dedup Backup Configuration
-backups:
-  backend: \"${BACKUP_BACKEND}\"
-  storage_mode: \"${STORAGE_MODE}\"
-  kopia:
-    enabled: true
-    s3:
-      endpoint: \"${S3_ENDPOINT}\"
-      region: \"${S3_REGION}\"
-      bucket: \"${S3_BUCKET}\"
-      access_key: \"${S3_ACCESS_KEY}\"
-      secret_key: \"${S3_SECRET_KEY}\"
-    cache:
+  backups:
+    backend: \"${BACKUP_BACKEND}\"
+    storage_mode: \"${STORAGE_MODE}\"
+    kopia:
       enabled: true
-      path: \"${KOPIA_CACHE}\"
-      size_mb: ${KOPIA_CACHE_SIZE}
-    performance:
-      upload_bwlimit: \"${KOPIA_BWLIMIT}\"
-    encryption:
-      enabled: true
-      password: \"${KOPIA_PASSWORD}\""
+      s3:
+        endpoint: \"${S3_ENDPOINT}\"
+        region: \"${S3_REGION}\"
+        bucket: \"${S3_BUCKET}\"
+        access_key: \"${S3_ACCESS_KEY}\"
+        secret_key: \"${S3_SECRET_KEY}\"
+      cache:
+        enabled: true
+        path: \"${KOPIA_CACHE}\"
+        size_mb: ${KOPIA_CACHE_SIZE}
+      performance:
+        upload_bwlimit: \"${KOPIA_BWLIMIT}\"
+      encryption:
+        enabled: true
+        password: \"${KOPIA_PASSWORD}\""
         
         echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
     fi
@@ -863,18 +863,18 @@ backups:
     # DRC fetches backup list from remote, so useful for both remote and hybrid modes
     if [ -n "$REMOTE_REPO" ]; then
         BACKUP_CONFIG+="
-  drc:
-    enabled: true
-    access_path: \"/admin/drc\"
-    download_bwlimit: \"50M\""
+    drc:
+      enabled: true
+      access_path: \"/admin/drc\"
+      download_bwlimit: \"50M\""
         echo -e "  ${GREEN}✓${NC} Disaster Recovery Console enabled at /admin/drc"
     fi
     
     # Add notifications if webhook provided
     if [ -n "$DISCORD_WEBHOOK" ]; then
         BACKUP_CONFIG+="
-  notifications:
-    discord_webhook: \"${DISCORD_WEBHOOK}\""
+    notifications:
+      discord_webhook: \"${DISCORD_WEBHOOK}\""
         echo -e "  ${GREEN}✓${NC} Discord webhook configured"
     else
         echo -e "  ${YELLOW}○${NC} Discord webhook skipped"
@@ -888,13 +888,14 @@ backups:
         sed -i '/^# Wings-Dedup/d' "$CONFIG_FILE" 2>/dev/null || true
         sed -i '/^license:/,/^[a-z_]*:/{ /^[a-z_]*:/!d; /^license:/d; }' "$CONFIG_FILE" 2>/dev/null || true
         # Remove orphaned backups section under system if it exists
-        sed -i '/^  backups:/,/^  [a-z_]*:/{ /^  [a-z_]*:/!d; /^  backups:/d; }' "$CONFIG_FILE" 2>/dev/null || true
+        # This regex tries to delete backups block if indented
+        sed -i '/^\s*backups:/,/^\s*[a-z_]*:/{ /^\s*[a-z_]*:/!d; /^\s*backups:/d; }' "$CONFIG_FILE" 2>/dev/null || true
         
         # Remove trailing blank lines
         sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$CONFIG_FILE" 2>/dev/null || true
     fi
 
-    # Append license config
+    # Append license config (Top level)
     cat >> "$CONFIG_FILE" <<EOF
 
 # Wings-Dedup License
@@ -902,16 +903,20 @@ license:
   license_key: "${LICENSE_KEY}"
 EOF
 
-    # Append backup config - must go under system: which panel auto-deploy creates
+    # Insert backup config into system: block
     if grep -q "^system:" "$CONFIG_FILE" 2>/dev/null; then
-        # system: exists, append backups config (already has proper 2-space indentation)
-        cat >> "$CONFIG_FILE" <<EOF
-
-# Wings-Dedup Backup Configuration
-${BACKUP_CONFIG}
-EOF
+        # Use awk to find "system:" and insert our config right after it
+        awk -v new_config="$BACKUP_CONFIG" '
+            /^system:/ { 
+                print $0
+                print "# Wings-Dedup Backup Configuration"
+                print new_config
+                next
+            }
+            { print }
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     else
-        # system: doesn't exist (shouldn't happen if panel auto-deploy ran)
+        # system: doesn't exist (shouldn't happen if panel auto-deploy ran), create it
         cat >> "$CONFIG_FILE" <<EOF
 
 # Wings-Dedup Backup Configuration
