@@ -396,8 +396,10 @@ install_wings_dedup() {
     echo -e "  ${GREEN}✓${NC} Pterodactyl home directory ready"
 
     # Fix directory ownership (required for borg pre-flight)
-    chown -R pterodactyl:pterodactyl /var/lib/pterodactyl
-    echo -e "  ${GREEN}✓${NC} Directory ownership fixed"
+    # We only chown the specific directories we need to avoid race conditions with live server volumes
+    chown pterodactyl:pterodactyl /var/lib/pterodactyl
+    chown -R pterodactyl:pterodactyl /var/lib/pterodactyl/{backups,archives} 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} Directory ownership fixed (backups & archives)"
     echo ""
 
     # Step 3: Panel Configuration (FIRST - before asking for dedup settings)
@@ -811,7 +813,7 @@ EOF
                 
                 BACKUP_CONFIG+="
       sync:
-        mode: rsync
+        mode: native
         workers: 1
         batch_delay_seconds: ${SYNC_BATCH_DELAY}
         upload_bwlimit: \"${SYNC_BWLIMIT}\"
@@ -865,9 +867,9 @@ EOF
         BACKUP_CONFIG+="
     drc:
       enabled: true
-      access_path: \"/admin/drc\"
+      access_path: \"/admin/recovery\"
       download_bwlimit: \"50M\""
-        echo -e "  ${GREEN}✓${NC} Disaster Recovery Console enabled at /admin/drc"
+        echo -e "  ${GREEN}✓${NC} Disaster Recovery Console enabled at /admin/recovery"
     fi
     
     # Add notifications if webhook provided
