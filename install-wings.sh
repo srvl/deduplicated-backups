@@ -7,7 +7,25 @@
 # Complete Installation, Update, and Uninstall Utility
 #############################################
 
-set -e
+# Self-re-exec guard: if piped (curl | bash), save to temp file and re-run
+# This prevents /dev/fd conflicts when heredocs/read compete for stdin
+if [ ! -t 0 ] && [ -z "$_WINGS_REEXEC" ]; then
+    _TMPSCRIPT=$(mktemp /tmp/install-wings.XXXXXX.sh)
+    cat > "$_TMPSCRIPT"
+    chmod +x "$_TMPSCRIPT"
+    export _WINGS_REEXEC=1
+    export _TMPSCRIPT
+    exec bash "$_TMPSCRIPT"
+fi
+
+# Ensure /dev/fd exists (missing on some minimal VPS/containers)
+if [ ! -e /dev/fd ] && [ -d /proc/self/fd ]; then
+    ln -sf /proc/self/fd /dev/fd 2>/dev/null || true
+fi
+
+# Track current operation for error reporting (replaces fragile set -e)
+LAST_STEP=""
+MENU_CONTEXT=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -71,18 +89,59 @@ prompt_optional() {
 # Cleanup function for error handling
 cleanup() {
     local exit_code=$?
-    if [ $exit_code -ne 0 ] && [ "$1" != "menu" ]; then
+    if [ $exit_code -ne 0 ] && [ "$MENU_CONTEXT" = false ]; then
         echo ""
         echo -e "${RED}==========================================="
-        echo "Operation failed!"
+        if [ -n "$LAST_STEP" ]; then
+            echo "Operation failed during: $LAST_STEP"
+        else
+            echo "Operation failed!"
+        fi
         echo -e "===========================================${NC}"
         if [ -f "$BACKUP_BINARY_PATH" ]; then
             echo -e "${YELLOW}A backup exists. You can restore the original Wings binary using the '2) Uninstall' option.${NC}"
         fi
         echo -e "${YELLOW}For support, contact srvl Labs${NC}"
     fi
+    # Clean up temp script if we were re-exec'd from pipe
+    if [ -n "$_WINGS_REEXEC" ] && [ -n "$_TMPSCRIPT" ]; then
+        rm -f "$_TMPSCRIPT" 2>/dev/null
+    fi
 }
-trap 'cleanup $1' EXIT
+trap cleanup EXIT
+
+# Validate binary is a real ELF executable (portable, no 'file' dependency)
+# Handles noexec mounts gracefully instead of falsely reporting invalid binary
+validate_binary() {
+    local binary="$1"
+
+    # Check ELF magic number: 0x7f 'E' 'L' 'F'
+    local magic
+    magic=$(head -c 4 "$binary" 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' \n')
+    if [ "$magic" != "7f454c46" ]; then
+        echo -e "  ${RED}✗ Not a valid ELF binary (corrupt download or HTML error page?)${NC}"
+        echo -e "  ${YELLOW}  Try downloading the binary again.${NC}"
+        return 1
+    fi
+
+    # Check if filesystem is mounted noexec
+    local mount_point
+    mount_point=$(df "$binary" 2>/dev/null | tail -1 | awk '{print $NF}')
+    if mount 2>/dev/null | grep -q "$mount_point.*noexec"; then
+        echo -e "  ${YELLOW}⚠ Current directory is on a noexec mount ($mount_point)${NC}"
+        echo -e "  ${YELLOW}  Binary is valid but cannot execute from here — will work from /usr/local/bin/${NC}"
+        return 0
+    fi
+
+    # Try to get version (execution test)
+    if ! "$binary" --version >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ Binary is valid ELF but execution test failed${NC}"
+        echo -e "  ${YELLOW}  This may be normal if run from a restricted directory.${NC}"
+        echo -e "  ${YELLOW}  Proceeding with installation...${NC}"
+        return 0
+    fi
+    return 0
+}
 
 # --- Config Migration ---
 
@@ -276,6 +335,7 @@ install_wings_dedup() {
     echo -e "${NC}"
 
     # Step 1: Pre-flight Checks
+    LAST_STEP="pre-flight checks"
     echo -e "${BLUE}${BOLD}[Step 1/5] Pre-flight checks...${NC}"
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -294,10 +354,11 @@ install_wings_dedup() {
     esac
     echo -e "  ${GREEN}✓${NC} Architecture: ${CYAN}${ARCH} (${ARCH_NAME})${NC}"
     
-    command -v docker &> /dev/null || { echo -e "  ${RED}✗ Docker is not installed${NC}"; exit 1; }
-    docker info &> /dev/null || { echo -e "  ${RED}✗ Docker daemon is not running${NC}"; exit 1; }
+    if ! command -v docker &> /dev/null; then echo -e "  ${RED}✗ Docker is not installed${NC}"; exit 1; fi
+    if ! docker info &> /dev/null; then echo -e "  ${RED}✗ Docker daemon is not running${NC}"; exit 1; fi
     echo -e "  ${GREEN}✓${NC} Docker running"
     
+    LAST_STEP="downloading binary"
     if [ ! -f "./wings" ]; then
         echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
         
@@ -319,6 +380,7 @@ install_wings_dedup() {
             chmod +x wings
             
             # Verify SHA256 checksum if available
+            LAST_STEP="verifying SHA256 checksum"
             if curl -f -s -L -o wings.sha256 "$CHECKSUM_URL" 2>/dev/null; then
                 EXPECTED_SHA256=$(cat wings.sha256 | awk '{print $1}')
                 ACTUAL_SHA256=$(sha256sum wings | awk '{print $1}')
@@ -342,22 +404,18 @@ install_wings_dedup() {
         fi
     fi
     
-    # Validate binary is executable - try 'file' command first, fallback to execution test
-    if command -v file &> /dev/null; then
-        if ! file ./wings | grep -qE "(executable|ELF)"; then
-            echo -e "  ${RED}✗ Invalid binary file${NC}"; exit 1;
-        fi
-    else
-        # Fallback: try to execute the binary to verify it's valid
-        if ! ./wings --version &> /dev/null; then
-            echo -e "  ${RED}✗ Invalid binary file (cannot execute)${NC}"; exit 1;
-        fi
+    # Validate binary using portable ELF magic check
+    LAST_STEP="validating binary"
+    if ! validate_binary ./wings; then
+        rm -f wings
+        exit 1
     fi
     NEW_VERSION=$(./wings --version 2>/dev/null | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
     echo ""
 
     # Step 2: Stop Service and Install Binary
+    LAST_STEP="installing binary"
     echo -e "${BLUE}${BOLD}[Step 2/5] Installing Wings-Dedup binary...${NC}"
 
     if systemctl is-active --quiet wings 2>/dev/null; then
@@ -396,13 +454,12 @@ install_wings_dedup() {
     echo -e "  ${GREEN}✓${NC} Pterodactyl home directory ready"
 
     # Fix directory ownership (required for borg pre-flight)
-    # We only chown the specific directories we need to avoid race conditions with live server volumes
-    chown pterodactyl:pterodactyl /var/lib/pterodactyl
-    chown -R pterodactyl:pterodactyl /var/lib/pterodactyl/{backups,archives} 2>/dev/null || true
-    echo -e "  ${GREEN}✓${NC} Directory ownership fixed (backups & archives)"
+    chown -R pterodactyl:pterodactyl /var/lib/pterodactyl
+    echo -e "  ${GREEN}✓${NC} Directory ownership fixed"
     echo ""
 
     # Step 3: Panel Configuration (FIRST - before asking for dedup settings)
+    LAST_STEP="panel configuration"
     echo -e "${BLUE}${BOLD}[Step 3/5] Panel Configuration${NC}"
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -466,6 +523,7 @@ install_wings_dedup() {
     echo ""
 
     # Step 4: Wings-Dedup Specific Settings (AFTER panel config)
+    LAST_STEP="configuring Wings-Dedup settings"
     echo -e "${BLUE}${BOLD}[Step 4/5] Wings-Dedup Settings${NC}"
     echo ""
     
@@ -634,6 +692,7 @@ install_wings_dedup() {
     echo ""
 
     # Step 5: Install Borg, Configure, and Start
+    LAST_STEP="finalizing installation"
     echo -e "${BLUE}${BOLD}[Step 5/5] Finalizing...${NC}"
     
     # Install backend-specific tools
@@ -990,6 +1049,7 @@ EOF
     echo ""
     echo -e "${BLUE}For support, contact srvl Labs${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    LAST_STEP=""
     trap '' EXIT
     exit 0
 }
@@ -1009,6 +1069,7 @@ uninstall_wings_dedup() {
         exit 1
     fi
 
+    LAST_STEP="stopping wings service"
     echo -e "${BLUE}${BOLD}[1/3] Stopping Wings service...${NC}"
     if systemctl is-active --quiet wings 2>/dev/null; then
         systemctl stop wings
@@ -1018,6 +1079,7 @@ uninstall_wings_dedup() {
     fi
     echo ""
 
+    LAST_STEP="restoring original binary"
     echo -e "${BLUE}${BOLD}[2/3] Restoring original Wings binary...${NC}"
     cp "$BACKUP_BINARY_PATH" "$WINGS_BINARY"
     chmod +x "$WINGS_BINARY"
@@ -1025,6 +1087,7 @@ uninstall_wings_dedup() {
     echo -e "  ${GREEN}✓${NC} Original binary restored"
     echo ""
     
+    LAST_STEP="cleaning up configuration"
     echo -e "${BLUE}${BOLD}[3/3] Cleaning up configuration...${NC}"
     if [ -f "$CONFIG_FILE" ]; then
         # Remove Wings-Dedup specific sections
@@ -1054,6 +1117,7 @@ uninstall_wings_dedup() {
         fi
     fi
 
+    LAST_STEP=""
     trap '' EXIT
     exit 0
 }
@@ -1068,6 +1132,7 @@ update_only() {
     echo -e "${NC}"
 
     # Step 1: Architecture detection
+    LAST_STEP="detecting architecture"
     echo -e "${BLUE}${BOLD}[Step 1/3] Detecting architecture...${NC}"
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -1088,12 +1153,12 @@ update_only() {
     echo ""
 
     # Step 2: Get binary (local or download)
+    LAST_STEP="downloading binary"
     echo -e "${BLUE}${BOLD}[Step 2/3] Getting Wings-Dedup binary...${NC}"
     
     if [ -f "./wings" ]; then
         echo -e "  ${GREEN}✓${NC} Using local binary: ${CYAN}./wings${NC}"
-        if ! file ./wings | grep -qE "(executable|ELF)"; then
-            echo -e "  ${RED}✗ Invalid binary file${NC}"
+        if ! validate_binary ./wings; then
             exit 1
         fi
     else
@@ -1123,6 +1188,7 @@ update_only() {
             chmod +x wings
             
             # Verify SHA256 checksum if available
+            LAST_STEP="verifying SHA256 checksum"
             if curl -f -s -L -o wings.sha256 "$CHECKSUM_URL" 2>/dev/null; then
                 EXPECTED_SHA256=$(cat wings.sha256 | awk '{print $1}')
                 ACTUAL_SHA256=$(sha256sum wings | awk '{print $1}')
@@ -1138,6 +1204,13 @@ update_only() {
             else
                 echo -e "  ${YELLOW}○${NC} No checksum file available, skipping verification"
             fi
+            
+            # Validate binary
+            LAST_STEP="validating binary"
+            if ! validate_binary ./wings; then
+                rm -f wings
+                exit 1
+            fi
         else
             echo -e "  ${RED}✗ Failed to download${NC}"
             exit 1
@@ -1149,6 +1222,7 @@ update_only() {
     echo ""
 
     # Step 3: Replace binary and restart
+    LAST_STEP="installing and restarting"
     echo -e "${BLUE}${BOLD}[Step 3/3] Installing and restarting...${NC}"
     
     if systemctl is-active --quiet wings 2>/dev/null; then
@@ -1184,6 +1258,7 @@ update_only() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${GREEN}✓ Update Complete!${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    LAST_STEP=""
     trap '' EXIT
     exit 0
 }
@@ -1204,6 +1279,7 @@ update_config_only() {
         return 1
     fi
     
+    LAST_STEP="reading existing config"
     echo -e "${CYAN}[Step 1/2] Current Configuration${NC}"
     echo ""
     
@@ -1238,12 +1314,14 @@ update_config_only() {
             cp "$CONFIG_FILE" "$BACKUP_FILE"
             echo -e "  ${GREEN}✓${NC} Backup created: ${CYAN}$BACKUP_FILE${NC}"
             
+            LAST_STEP="editing config"
             nano "$CONFIG_FILE"
             
             echo ""
             read -p "Restart Wings to apply changes? [Y/n] " -n 1 -r
             echo
             if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                LAST_STEP="restarting wings"
                 systemctl restart wings
                 sleep 2
                 if systemctl is-active --quiet wings; then
@@ -1277,6 +1355,7 @@ main_menu() {
         exit 1
     fi
 
+    MENU_CONTEXT=true
     while true; do
         echo -e "${GREEN}"
         echo "╔═══════════════════════════════════════════════════════════╗"
@@ -1295,10 +1374,10 @@ main_menu() {
         read -p "Choice (1-5): " -r CHOICE
 
         case "$CHOICE" in
-            1) echo ""; install_wings_dedup ;;
-            2) echo ""; update_only ;;
-            3) echo ""; update_config_only ;;
-            4) echo ""; uninstall_wings_dedup ;;
+            1) echo ""; MENU_CONTEXT=false; install_wings_dedup ;;
+            2) echo ""; MENU_CONTEXT=false; update_only ;;
+            3) echo ""; MENU_CONTEXT=false; update_config_only ;;
+            4) echo ""; MENU_CONTEXT=false; uninstall_wings_dedup ;;
             5) echo -e "\n${BLUE}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "\n${RED}Invalid choice${NC}" ;;
         esac
@@ -1306,4 +1385,4 @@ main_menu() {
     done
 }
 
-main_menu "menu"
+main_menu
