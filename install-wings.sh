@@ -133,14 +133,48 @@ validate_binary() {
         return 0
     fi
 
-    # Try to get version (execution test)
-    if ! "$binary" --version >/dev/null 2>&1; then
+    # Try to get version (execution test). Wings exposes "version" as a subcommand,
+    # not a --version flag, so use the subcommand or this test always falsely fails.
+    if ! "$binary" version >/dev/null 2>&1; then
         echo -e "  ${YELLOW}⚠ Binary is valid ELF but execution test failed${NC}"
         echo -e "  ${YELLOW}  This may be normal if run from a restricted directory.${NC}"
         echo -e "  ${YELLOW}  Proceeding with installation...${NC}"
         return 0
     fi
     return 0
+}
+
+# --- Systemd Unit ---
+
+# Write (or refresh) the canonical wings systemd unit, then reload systemd.
+# Centralised so the install AND update paths emit the exact same unit and can
+# never drift. This is also a self-heal: older installers baked removed flags
+# (e.g. --skip-license) or an ionice wrapper into ExecStart, which makes a newer
+# binary fail to start. Calling this on every update rewrites those away.
+write_systemd_unit() {
+    cat > /etc/systemd/system/wings.service <<'EOF'
+[Unit]
+Description=Pterodactyl Wings Daemon (Wings-Dedup)
+After=docker.service network-online.target
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
 }
 
 # --- Config Migration ---
@@ -410,7 +444,7 @@ install_wings_dedup() {
         rm -f wings
         exit 1
     fi
-    NEW_VERSION=$(./wings --version 2>/dev/null | head -1 || echo "unknown")
+    NEW_VERSION=$(./wings version 2>/dev/null | grep -i dedup | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
     echo ""
 
@@ -990,30 +1024,7 @@ EOF
     echo -e "  ${GREEN}✓${NC} Config saved and permissions secured"
 
     # Create systemd service
-    cat > /etc/systemd/system/wings.service <<'EOF'
-[Unit]
-Description=Pterodactyl Wings Daemon (Wings-Dedup)
-After=docker.service network-online.target
-Wants=docker.service
-PartOf=docker.service
-
-[Service]
-User=root
-WorkingDirectory=/etc/pterodactyl
-LimitNOFILE=4096
-PIDFile=/run/wings/daemon.pid
-ExecStart=/usr/local/bin/wings
-Restart=on-failure
-StartLimitInterval=180
-StartLimitBurst=30
-RestartSec=5s
-RestartPreventExitStatus=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
+    write_systemd_unit
     systemctl enable wings > /dev/null 2>&1
     echo -e "  ${GREEN}✓${NC} Systemd service configured"
     echo ""
@@ -1217,7 +1228,7 @@ update_only() {
         fi
     fi
     
-    NEW_VERSION=$(./wings --version 2>/dev/null | head -1 || echo "unknown")
+    NEW_VERSION=$(./wings version 2>/dev/null | grep -i dedup | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
     echo ""
 
@@ -1240,10 +1251,16 @@ update_only() {
     chmod +x "$WINGS_BINARY"
     rm -f wings
     echo -e "  ${GREEN}✓${NC} Binary replaced"
-    
+
+    # Refresh the systemd unit so updates self-heal stale units written by older
+    # installers (e.g. ones that passed the now-removed --skip-license flag, which
+    # otherwise makes the new binary fail to start in a restart loop).
+    write_systemd_unit
+    echo -e "  ${GREEN}✓${NC} Systemd unit refreshed"
+
     # Migrate legacy config if needed
     migrate_legacy_config
-    
+
     systemctl start wings
     sleep 2
     
