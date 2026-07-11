@@ -144,6 +144,74 @@ validate_binary() {
     return 0
 }
 
+# Stage a binary shipped alongside this script, so an install/update uses what the
+# operator actually put on the box instead of silently pulling a different build
+# from GitHub. Only if nothing is found locally do the callers fall back to a
+# download.
+#
+# Searched in order: the arch-specific artifact that build.sh produces
+# (wings_amd/wings_arm) first, since that is what ships in the release archive,
+# then a plain ./wings. Both the working directory and the script's own directory
+# are checked — the release archive is usually extracted somewhere other than
+# where the operator happens to be standing.
+#
+# Sets STAGED_BINARY to the path of the binary to install (always ./wings) and
+# returns 0 when one was found, 1 when the caller should download instead.
+stage_local_binary() {
+    local candidate found=""
+
+    local script_dir=""
+    # When piped (curl | bash) the script lives in a temp file, so its directory
+    # holds nothing useful — don't bother searching it.
+    if [ -z "$_WINGS_REEXEC" ]; then
+        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+    fi
+
+    for candidate in "./${BINARY_NAME}" "./wings" ${script_dir:+"${script_dir}/${BINARY_NAME}" "${script_dir}/wings"}; do
+        if [ -f "$candidate" ]; then
+            found="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$found" ]; then
+        return 1
+    fi
+
+    echo -e "  ${GREEN}✓${NC} Using local binary: ${CYAN}${found}${NC}"
+
+    # Verify against the checksum shipped next to it, when there is one. A local
+    # binary is trusted more than a download, but a truncated copy is still worth
+    # catching before it replaces a working wings.
+    if [ -f "${found}.sha256" ]; then
+        LAST_STEP="verifying SHA256 checksum"
+        local expected actual
+        expected=$(awk '{print $1}' "${found}.sha256")
+        actual=$(sha256sum "$found" | awk '{print $1}')
+        if [ "$expected" != "$actual" ]; then
+            echo -e "  ${RED}✗ SHA256 checksum mismatch for ${found}!${NC}"
+            echo -e "  ${YELLOW}  Expected: ${expected}${NC}"
+            echo -e "  ${YELLOW}  Actual:   ${actual}${NC}"
+            echo -e "  ${YELLOW}  The local binary looks corrupt — remove it to download instead.${NC}"
+            exit 1
+        fi
+        echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
+    fi
+
+    # Everything downstream installs ./wings, so normalise onto that name. -ef
+    # guards the case where the file found already IS ./wings (cp onto itself).
+    if [ ! "$found" -ef "./wings" ]; then
+        if ! cp "$found" ./wings; then
+            echo -e "  ${RED}✗ Failed to copy ${found} to ./wings${NC}"
+            exit 1
+        fi
+    fi
+    chmod +x ./wings
+
+    STAGED_BINARY="./wings"
+    return 0
+}
+
 # --- Systemd Unit ---
 
 # Write (or refresh) the canonical wings systemd unit, then reload systemd.
@@ -392,10 +460,14 @@ install_wings_dedup() {
     if ! docker info &> /dev/null; then echo -e "  ${RED}✗ Docker daemon is not running${NC}"; exit 1; fi
     echo -e "  ${GREEN}✓${NC} Docker running"
     
-    LAST_STEP="downloading binary"
-    if [ ! -f "./wings" ]; then
-        echo -e "  ${YELLOW}Binary not found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
-        
+    # Prefer a binary shipped next to this script; only reach for GitHub if there
+    # isn't one, so an operator who dropped a specific build on the box gets that
+    # build installed rather than whatever the latest release happens to be.
+    LAST_STEP="locating binary"
+    if ! stage_local_binary; then
+        LAST_STEP="downloading binary"
+        echo -e "  ${YELLOW}No local binary found. Downloading latest wings-dedup for ${ARCH_NAME}...${NC}"
+
         # Fetch latest release tag from GitHub API
         LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$LATEST_TAG" ]; then
@@ -1164,16 +1236,17 @@ update_only() {
     echo ""
 
     # Step 2: Get binary (local or download)
-    LAST_STEP="downloading binary"
+    LAST_STEP="locating binary"
     echo -e "${BLUE}${BOLD}[Step 2/3] Getting Wings-Dedup binary...${NC}"
-    
-    if [ -f "./wings" ]; then
-        echo -e "  ${GREEN}✓${NC} Using local binary: ${CYAN}./wings${NC}"
+
+    # A local binary always wins over the GitHub release — see stage_local_binary.
+    if stage_local_binary; then
         if ! validate_binary ./wings; then
             exit 1
         fi
     else
-        echo -e "  ${YELLOW}Downloading latest release...${NC}"
+        LAST_STEP="downloading binary"
+        echo -e "  ${YELLOW}No local binary found. Downloading latest release...${NC}"
         
         API_URL="https://api.github.com/repos/srvl/deduplicated-backups/releases/latest"
         API_RESPONSE=$(curl -s "$API_URL")
