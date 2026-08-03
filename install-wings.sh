@@ -128,15 +128,15 @@ validate_binary() {
     local mount_point
     mount_point=$(df "$binary" 2>/dev/null | tail -1 | awk '{print $NF}')
     if mount 2>/dev/null | grep -q "$mount_point.*noexec"; then
-        echo -e "  ${YELLOW}⚠ Current directory is on a noexec mount ($mount_point)${NC}"
-        echo -e "  ${YELLOW}  Binary is valid but cannot execute from here — will work from /usr/local/bin/${NC}"
+        echo -e "  ${YELLOW}! Current directory is on a noexec mount ($mount_point)${NC}"
+        echo -e "  ${YELLOW}  Binary is valid but cannot execute from here, will work from /usr/local/bin/${NC}"
         return 0
     fi
 
     # Try to get version (execution test). Wings exposes "version" as a subcommand,
     # not a --version flag, so use the subcommand or this test always falsely fails.
     if ! "$binary" version >/dev/null 2>&1; then
-        echo -e "  ${YELLOW}⚠ Binary is valid ELF but execution test failed${NC}"
+        echo -e "  ${YELLOW}! Binary is valid ELF but execution test failed${NC}"
         echo -e "  ${YELLOW}  This may be normal if run from a restricted directory.${NC}"
         echo -e "  ${YELLOW}  Proceeding with installation...${NC}"
         return 0
@@ -152,7 +152,7 @@ validate_binary() {
 # Searched in order: the arch-specific artifact that build.sh produces
 # (wings_amd/wings_arm) first, since that is what ships in the release archive,
 # then a plain ./wings. Both the working directory and the script's own directory
-# are checked — the release archive is usually extracted somewhere other than
+# are checked, the release archive is usually extracted somewhere other than
 # where the operator happens to be standing.
 #
 # Sets STAGED_BINARY to the path of the binary to install (always ./wings) and
@@ -162,7 +162,7 @@ stage_local_binary() {
 
     local script_dir=""
     # When piped (curl | bash) the script lives in a temp file, so its directory
-    # holds nothing useful — don't bother searching it.
+    # holds nothing useful, don't bother searching it.
     if [ -z "$_WINGS_REEXEC" ]; then
         script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
     fi
@@ -192,7 +192,7 @@ stage_local_binary() {
             echo -e "  ${RED}✗ SHA256 checksum mismatch for ${found}!${NC}"
             echo -e "  ${YELLOW}  Expected: ${expected}${NC}"
             echo -e "  ${YELLOW}  Actual:   ${actual}${NC}"
-            echo -e "  ${YELLOW}  The local binary looks corrupt — remove it to download instead.${NC}"
+            echo -e "  ${YELLOW}  The local binary looks corrupt, remove it to download instead.${NC}"
             exit 1
         fi
         echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
@@ -243,6 +243,190 @@ RestartPreventExitStatus=3
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
+}
+
+# --- Config Reconciliation (fill in keys added by newer versions) ---
+#
+# A node installed on an older release has a config.yml that predates whatever
+# keys the new binary introduced. Those keys then silently take their compiled-in
+# struct defaults, which is how an operator ends up running a retention or
+# safety policy they never chose and cannot see in their config file.
+#
+# On update we therefore look for keys the current release cares about, and ask
+# for a value for each one that is missing. Only ADDITIVE: an existing value is
+# never read back, re-prompted or rewritten.
+#
+# To support a new key, add one stanza to reconcile_missing_config_keys below.
+
+# config_anchor_exists <anchor_regex>
+config_anchor_exists() {
+    grep -qE "$1" "$CONFIG_FILE" 2>/dev/null
+}
+
+# config_block_has_key <anchor_regex> <key>
+# True when <key> appears inside the block introduced by <anchor_regex>. Scoped
+# to the block rather than the whole file because leaf names like "enabled" are
+# far from unique in this config.
+config_block_has_key() {
+    awk -v anchor="$1" -v key="$2" '
+        {
+            match($0, /^ */); indent = RLENGTH
+            if (inblock) {
+                if ($0 ~ /[^[:space:]]/ && indent <= anchor_indent) { inblock = 0 }
+                else if ($0 ~ ("^[[:space:]]+" key ":")) { found = 1; exit }
+            }
+            if (!inblock && $0 ~ anchor) { inblock = 1; anchor_indent = indent }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$CONFIG_FILE"
+}
+
+# config_insert_after_anchor <anchor_regex> <text>
+# <text> may contain newlines. Writes through the existing file so ownership and
+# permissions are preserved (a mv would replace the inode).
+config_insert_after_anchor() {
+    local anchor="$1" text="$2" tmp
+    tmp="$(mktemp)"
+    awk -v anchor="$anchor" -v text="$text" '
+        { print }
+        (!done && $0 ~ anchor) { print text; done = 1 }
+    ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$CONFIG_FILE"
+    rm -f "$tmp"
+}
+
+# config_yaml_is_valid, best effort. Returns success when we cannot check, so a
+# box without python3 is not blocked from updating.
+config_yaml_is_valid() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    python3 - "$CONFIG_FILE" <<'PYEOF' >/dev/null 2>&1
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)  # cannot check; do not block
+try:
+    yaml.safe_load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# reconcile_missing_config_keys, prompt for and add any missing known keys.
+reconcile_missing_config_keys() {
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    local backend storage_mode
+    backend=$(grep -E "^\s*backend:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*backend:\s*//' | tr -d '"' | tr -d "'" | xargs)
+    storage_mode=$(grep -E "^\s*storage_mode:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*storage_mode:\s*//' | tr -d '"' | tr -d "'" | xargs)
+    [ -n "$backend" ] || backend="borg"
+
+    # Collect what is missing before prompting for anything, so the operator is
+    # told up front how many questions are coming (and can skip the lot).
+    local -a missing=()
+    config_block_has_key '^  backups:' 'transfer_grace_days' || missing+=("transfer_grace_days")
+    if [ "$backend" = "borg" ] && [ "$storage_mode" = "hybrid" ]; then
+        config_block_has_key '^      sync:' 'disable_auto_prune'    || missing+=("disable_auto_prune")
+        config_block_has_key '^      sync:' 'remote_retention_days' || missing+=("remote_retention_days")
+        config_anchor_exists '^        remote_prune:'               || missing+=("remote_prune")
+    fi
+    if [ "$backend" = "kopia" ]; then
+        config_block_has_key '^    kopia:' 'deleted_grace_days' || missing+=("deleted_grace_days")
+    fi
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} Config has every setting this release knows about"
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${YELLOW}This release adds ${#missing[@]} setting(s) your config.yml does not have:${NC}"
+    local m
+    for m in "${missing[@]}"; do echo -e "    ${CYAN}• ${m}${NC}"; done
+    echo -e "  ${YELLOW}Unanswered, they silently use built-in defaults. Existing values are${NC}"
+    echo -e "  ${YELLOW}never changed, this only ADDS the missing keys.${NC}"
+    echo ""
+
+    local do_it
+    prompt_with_default "  Fill them in now? (yes/no)" "yes" do_it
+    case "${do_it,,}" in
+        n|no|false|0)
+            echo -e "  ${YELLOW}Skipped, built-in defaults will apply.${NC}"
+            return 0
+            ;;
+    esac
+
+    local backup_file="${CONFIG_FILE}.pre-reconcile.$(date +%Y%m%d_%H%M%S)"
+    cp "$CONFIG_FILE" "$backup_file"
+    echo -e "  ${GREEN}✓${NC} Backup: ${CYAN}${backup_file}${NC}"
+    echo ""
+
+    local val
+    for m in "${missing[@]}"; do
+        case "$m" in
+            transfer_grace_days)
+                echo -e "  ${CYAN}transfer_grace_days${NC}, days a transferred-away server's backups are"
+                echo -e "  kept on this node before orphan cleanup may reap them. ${BOLD}0 = never delete.${NC}"
+                prompt_with_default "    Value" "30" val
+                config_insert_after_anchor '^  backups:' "    transfer_grace_days: ${val}"
+                ;;
+            disable_auto_prune)
+                echo -e "  ${CYAN}disable_auto_prune${NC}, set true to stop the nightly remote prune+compact."
+                echo -e "  Leaving it false is recommended: without the nightly job the remote"
+                echo -e "  repository never reclaims space and the storage box fills up."
+                prompt_with_default "    Disable nightly remote prune? (true/false)" "false" val
+                config_insert_after_anchor '^      sync:' "        disable_auto_prune: ${val}"
+                ;;
+            remote_retention_days)
+                echo -e "  ${CYAN}remote_retention_days${NC}, days a backup stays on the REMOTE after being"
+                echo -e "  deleted locally/in the panel. ${BOLD}0 = never delete anything remotely.${NC}"
+                echo -e "  Backups that still exist locally are always kept, at any age."
+                prompt_with_default "    Value" "7" val
+                config_insert_after_anchor '^      sync:' "        remote_retention_days: ${val}"
+                ;;
+            remote_prune)
+                echo -e "  ${CYAN}remote_prune${NC}, OPTIONAL long-term history kept on the remote beyond"
+                echo -e "  the grace period above, per server. These only ever ADD retention."
+                echo -e "  0 for all three = off (recommended unless you want deep DR history)."
+                local kd kw km
+                prompt_with_default "    Keep daily" "0" kd
+                prompt_with_default "    Keep weekly" "0" kw
+                prompt_with_default "    Keep monthly" "0" km
+                local rp_enabled="false"
+                [ "$((kd + kw + km))" -gt 0 ] && rp_enabled="true"
+                config_insert_after_anchor '^      sync:' \
+"        remote_prune:
+          enabled: ${rp_enabled}
+          keep_daily: ${kd}
+          keep_weekly: ${kw}
+          keep_monthly: ${km}"
+                ;;
+            deleted_grace_days)
+                echo -e "  ${CYAN}deleted_grace_days${NC}, days a deleted backup stays RECOVERABLE before its"
+                echo -e "  kopia snapshot is really removed and its space reclaimed. ${BOLD}0 = immediate.${NC}"
+                prompt_with_default "    Value" "7" val
+                if config_anchor_exists '^      maintenance:'; then
+                    config_insert_after_anchor '^      maintenance:' "        deleted_grace_days: ${val}"
+                else
+                    config_insert_after_anchor '^    kopia:' \
+"      maintenance:
+        deleted_grace_days: ${val}"
+                fi
+                ;;
+        esac
+        echo ""
+    done
+
+    if config_yaml_is_valid; then
+        echo -e "  ${GREEN}✓${NC} Config updated and parses cleanly"
+    else
+        echo -e "  ${RED}✗ The updated config.yml no longer parses, restoring the backup${NC}"
+        cp "$backup_file" "$CONFIG_FILE"
+        echo -e "  ${YELLOW}Restored from ${backup_file}. Please add the settings by hand.${NC}"
+        return 1
+    fi
 }
 
 # --- Config Migration ---
@@ -394,6 +578,13 @@ extract_config_values() {
     OLD_RSYNC_CONCURRENCY=$(grep -E "^\s*rsync_concurrency:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*rsync_concurrency:\s*//' | xargs || echo "4")
     OLD_REMOTE_RETENTION=$(grep -E "^\s*remote_retention_days:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*remote_retention_days:\s*//' | xargs || echo "0")
     OLD_STALE_WORKER_MINS=$(grep -E "^\s*stale_worker_minutes:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*stale_worker_minutes:\s*//' | xargs || echo "5")
+
+    # Remote prune settings (nightly DR-repository retention)
+    OLD_DISABLE_AUTO_PRUNE=$(grep -E "^\s*disable_auto_prune:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*disable_auto_prune:\s*//' | xargs || echo "false")
+    if [ "$OLD_DISABLE_AUTO_PRUNE" = "true" ]; then OLD_AUTO_PRUNE="no"; else OLD_AUTO_PRUNE="yes"; fi
+    OLD_KEEP_DAILY=$(grep -E "^\s*keep_daily:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*keep_daily:\s*//' | xargs || echo "0")
+    OLD_KEEP_WEEKLY=$(grep -E "^\s*keep_weekly:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*keep_weekly:\s*//' | xargs || echo "0")
+    OLD_KEEP_MONTHLY=$(grep -E "^\s*keep_monthly:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*keep_monthly:\s*//' | xargs || echo "0")
 
     # DRC settings
     OLD_DRC_ENABLED=$(grep -A5 "drc:" "$CONFIG_FILE" 2>/dev/null | grep -E "^\s*enabled:" | head -1 | sed 's/.*enabled:\s*//' | xargs || echo "false")
@@ -593,7 +784,7 @@ install_wings_dedup() {
         echo ""
         echo -e "  ${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "  ${YELLOW}${BOLD}Paste the 'wings configure' command from your Pterodactyl Panel${NC}"
-        echo -e "  ${YELLOW}(Admin → Nodes → [Your Node] → Configuration tab)${NC}"
+        echo -e "  ${YELLOW}(Admin -> Nodes -> [Your Node] -> Configuration tab)${NC}"
         echo -e "  ${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
         echo -n "  > "
@@ -743,6 +934,42 @@ install_wings_dedup() {
                 prompt_with_default "  Sync Timeout (hours)" "$timeout_default" SYNC_TIMEOUT_HOURS
                 prompt_with_default "  Lock Wait (seconds)" "$lock_wait_default" SYNC_LOCK_WAIT
                 
+                echo ""
+                echo -e "  ${CYAN}── Remote Retention (disaster-recovery repository) ──${NC}"
+                echo -e "  ${YELLOW}  Borg frees no disk space on delete until a compact runs, so without${NC}"
+                echo -e "  ${YELLOW}  the nightly job the remote grows until the storage box is full.${NC}"
+                echo ""
+                echo -e "  ${GREEN}  Always enforced, not configurable:${NC}"
+                echo -e "  ${GREEN}   • a backup that still exists locally / in the panel is NEVER removed${NC}"
+                echo -e "  ${GREEN}     from the remote, at any age${NC}"
+                echo -e "  ${GREEN}   • every backup is kept on the remote for the grace period below,${NC}"
+                echo -e "  ${GREEN}     even after it is deleted locally / in the panel${NC}"
+                echo -e "  ${GREEN}   • a compact always follows a delete, so space is actually freed${NC}"
+                echo ""
+
+                retention_days_default="${OLD_REMOTE_RETENTION:-7}"
+
+                prompt_with_default "  Nightly remote prune + compact (yes/no)" "${OLD_AUTO_PRUNE:-yes}" REMOTE_AUTO_PRUNE
+                case "${REMOTE_AUTO_PRUNE,,}" in
+                    n|no|false|0) REMOTE_DISABLE_AUTO_PRUNE="true" ;;
+                    *)            REMOTE_DISABLE_AUTO_PRUNE="false" ;;
+                esac
+
+                if [ "$REMOTE_DISABLE_AUTO_PRUNE" = "false" ]; then
+                    echo -e "  ${YELLOW}  Grace period: days a backup stays on the remote after being deleted${NC}"
+                    echo -e "  ${YELLOW}  locally (0 = never delete anything, e.g. append-only SSH)${NC}"
+                    prompt_with_default "  Remote grace period (days)" "$retention_days_default" REMOTE_RETENTION_DAYS
+
+                    echo ""
+                    echo -e "  ${YELLOW}  Optional long-term history: keep some archives beyond the grace${NC}"
+                    echo -e "  ${YELLOW}  period, per server, after they are gone locally. These can only${NC}"
+                    echo -e "  ${YELLOW}  ADD retention; they never shorten the two rules above.${NC}"
+                    echo -e "  ${YELLOW}  0 = off (the remote then holds exactly the two rules above).${NC}"
+                    prompt_with_default "  Keep daily" "${OLD_KEEP_DAILY:-0}" REMOTE_KEEP_DAILY
+                    prompt_with_default "  Keep weekly" "${OLD_KEEP_WEEKLY:-0}" REMOTE_KEEP_WEEKLY
+                    prompt_with_default "  Keep monthly" "${OLD_KEEP_MONTHLY:-0}" REMOTE_KEEP_MONTHLY
+                fi
+
                 echo ""
                 echo -e "  ${YELLOW}  Some providers (Hetzner Storage Box) use separate SSH keys for${NC}"
                 echo -e "  ${YELLOW}  borg-serve vs rsync/SFTP access. Leave blank if same key works for both.${NC}"
@@ -991,10 +1218,29 @@ EOF
         rsync_ssh_key: \"${RSYNC_SSH_KEY}\""
                 fi
                 
+                REMOTE_DISABLE_AUTO_PRUNE="${REMOTE_DISABLE_AUTO_PRUNE:-false}"
+                REMOTE_RETENTION_DAYS="${REMOTE_RETENTION_DAYS:-7}"
+                REMOTE_KEEP_DAILY="${REMOTE_KEEP_DAILY:-0}"
+                REMOTE_KEEP_WEEKLY="${REMOTE_KEEP_WEEKLY:-0}"
+                REMOTE_KEEP_MONTHLY="${REMOTE_KEEP_MONTHLY:-0}"
+
+                # Keep-rules are only meaningful if at least one is non-zero.
+                if [ "$((REMOTE_KEEP_DAILY + REMOTE_KEEP_WEEKLY + REMOTE_KEEP_MONTHLY))" -gt 0 ]; then
+                    REMOTE_PRUNE_ENABLED="true"
+                else
+                    REMOTE_PRUNE_ENABLED="false"
+                fi
+
                 BACKUP_CONFIG+="
         rsync_delete: false
-        remote_retention_days: 0
-        stale_worker_minutes: 5"
+        remote_retention_days: ${REMOTE_RETENTION_DAYS}
+        stale_worker_minutes: 5
+        disable_auto_prune: ${REMOTE_DISABLE_AUTO_PRUNE}
+        remote_prune:
+          enabled: ${REMOTE_PRUNE_ENABLED}
+          keep_daily: ${REMOTE_KEEP_DAILY}
+          keep_weekly: ${REMOTE_KEEP_WEEKLY}
+          keep_monthly: ${REMOTE_KEEP_MONTHLY}"
             fi
         fi
         
@@ -1239,7 +1485,7 @@ update_only() {
     LAST_STEP="locating binary"
     echo -e "${BLUE}${BOLD}[Step 2/3] Getting Wings-Dedup binary...${NC}"
 
-    # A local binary always wins over the GitHub release — see stage_local_binary.
+    # A local binary always wins over the GitHub release; see stage_local_binary.
     if stage_local_binary; then
         if ! validate_binary ./wings; then
             exit 1
@@ -1334,6 +1580,11 @@ update_only() {
     # Migrate legacy config if needed
     migrate_legacy_config
 
+    # Ask about any setting this release added that the existing config.yml
+    # lacks, so an updated node isn't silently running on compiled-in defaults.
+    LAST_STEP="reconciling config keys"
+    reconcile_missing_config_keys
+
     systemctl start wings
     sleep 2
     
@@ -1392,10 +1643,11 @@ update_config_only() {
     echo -e "  ${YELLOW}Choose an option:${NC}"
     echo -e "    ${GREEN}1)${NC} Open config in nano (manual edit)"
     echo -e "    ${CYAN}2)${NC} Re-run full setup (option 1 - preserves values as defaults)"
-    echo -e "    ${RED}3)${NC} Cancel"
+    echo -e "    ${CYAN}3)${NC} Fill in settings added by newer versions (adds missing keys only)"
+    echo -e "    ${RED}4)${NC} Cancel"
     echo ""
-    
-    read -p "  Choice [1-3]: " -r EDIT_CHOICE
+
+    read -p "  Choice [1-4]: " -r EDIT_CHOICE
     
     case "$EDIT_CHOICE" in
         1)
@@ -1428,6 +1680,26 @@ update_config_only() {
             install_wings_dedup
             ;;
         3)
+            echo ""
+            LAST_STEP="reconciling config keys"
+            if reconcile_missing_config_keys; then
+                echo ""
+                read -p "Restart Wings to apply changes? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    LAST_STEP="restarting wings"
+                    systemctl restart wings
+                    sleep 2
+                    if systemctl is-active --quiet wings; then
+                        echo -e "  ${GREEN}✓${NC} Wings restarted successfully"
+                    else
+                        echo -e "  ${RED}✗${NC} Wings failed to start"
+                        echo -e "  ${YELLOW}Check: journalctl -u wings -e${NC}"
+                    fi
+                fi
+            fi
+            ;;
+        4)
             echo -e "  ${YELLOW}Cancelled${NC}"
             ;;
         *)
