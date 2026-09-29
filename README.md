@@ -49,11 +49,17 @@ system:
 
 ## Updating
 
-Run the installer and select option 2 for binary-only updates:
+Put the `wings_amd` / `wings_arm` from your latest download next to the installer, run it and
+select option 2 (binary-only update):
 
 ```bash
 ./install-wings.sh
 ```
+
+The installer uses a binary next to it before anything else. Without one it falls back to this
+repository's latest release, which can be older than your download, so it refuses to replace a
+newer installed version (`FORCE_DOWNGRADE=1` overrides). Option 1 on a node that is already set up
+also runs the update instead of rebuilding your backup settings (`FULL_SETUP_FORCE=1` overrides).
 
 ## Commands
 

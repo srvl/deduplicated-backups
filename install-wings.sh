@@ -620,7 +620,55 @@ extract_config_values() {
 
 # --- Core Installation Logic ---
 
+# "6.8.114" from `wings version` output, or empty.
+dedup_version_of() {
+    "$1" version 2>/dev/null | grep -i dedup | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
+}
+
+# Refuse to replace the installed binary with an OLDER wings-dedup (the public
+# release channel lags the builds customers get, so "latest release" can be a
+# downgrade). FORCE_DOWNGRADE=1 overrides. Returns non-zero to abort.
+guard_downgrade() {
+    local new cur=""
+    new=$(dedup_version_of ./wings)
+    [ -x "$WINGS_BINARY" ] && cur=$(dedup_version_of "$WINGS_BINARY")
+    if [ -z "$new" ] || [ -z "$cur" ] || [ "$new" = "$cur" ]; then
+        return 0
+    fi
+    if [ "$(printf '%s\n%s\n' "$new" "$cur" | sort -V | head -1)" = "$new" ]; then
+        if [ "${FORCE_DOWNGRADE:-0}" = "1" ]; then
+            echo -e "  ${YELLOW}⚠ Downgrading ${cur} -> ${new} (FORCE_DOWNGRADE=1)${NC}"
+            return 0
+        fi
+        echo -e "  ${RED}✗ Refusing to downgrade: installed ${cur}, this binary is ${new}.${NC}"
+        echo -e "  ${YELLOW}  Put the newer wings_amd/wings_arm from your download next to this script,${NC}"
+        echo -e "  ${YELLOW}  or re-run with FORCE_DOWNGRADE=1 if you really want ${new}.${NC}"
+        rm -f wings
+        return 1
+    fi
+    return 0
+}
+
+# True when config.yml already holds a Wings-Dedup backups block.
+has_dedup_config() {
+    [ -f "$CONFIG_FILE" ] && grep -qE '^[[:space:]]+(borg|kopia|drc|license_key):' "$CONFIG_FILE"
+}
+
 install_wings_dedup() {
+    # Full Setup rebuilds system.backups from its prompts and drops every setting
+    # it does not ask about (borg passphrase, kopia password, DRC password,
+    # webhook, grace days, maintenance). On a node that already has a
+    # Wings-Dedup config, update instead. FULL_SETUP_FORCE=1 overrides.
+    if has_dedup_config && [ "${FULL_SETUP_FORCE:-0}" != "1" ]; then
+        echo -e "${YELLOW}This node already has a Wings-Dedup config.${NC}"
+        echo -e "${YELLOW}Full Setup would rebuild system.backups and lose settings it does not prompt for,${NC}"
+        echo -e "${YELLOW}so running Update (binary + any settings newer versions added) instead.${NC}"
+        echo -e "${YELLOW}To change a setting, use option 3 and edit the config; FULL_SETUP_FORCE=1 forces a rebuild.${NC}"
+        echo ""
+        update_only
+        return
+    fi
+
     echo -e "${GREEN}"
     echo "╔═══════════════════════════════════════════════════════════╗"
     echo "║               Wings-Dedup Installation/Update             ║"
@@ -709,6 +757,7 @@ install_wings_dedup() {
     fi
     NEW_VERSION=$(./wings version 2>/dev/null | grep -i dedup | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
+    guard_downgrade || exit 1
     echo ""
 
     # Step 2: Stop Service and Install Binary
@@ -1549,6 +1598,7 @@ update_only() {
     
     NEW_VERSION=$(./wings version 2>/dev/null | grep -i dedup | head -1 || echo "unknown")
     echo -e "  ${GREEN}✓${NC} Version: ${CYAN}${NEW_VERSION}${NC}"
+    guard_downgrade || exit 1
     echo ""
 
     # Step 3: Replace binary and restart
@@ -1642,7 +1692,7 @@ update_config_only() {
     echo ""
     echo -e "  ${YELLOW}Choose an option:${NC}"
     echo -e "    ${GREEN}1)${NC} Open config in nano (manual edit)"
-    echo -e "    ${CYAN}2)${NC} Re-run full setup (option 1 - preserves values as defaults)"
+    echo -e "    ${CYAN}2)${NC} Re-run setup (updates the binary on an existing node; config kept)"
     echo -e "    ${CYAN}3)${NC} Fill in settings added by newer versions (adds missing keys only)"
     echo -e "    ${RED}4)${NC} Cancel"
     echo ""
