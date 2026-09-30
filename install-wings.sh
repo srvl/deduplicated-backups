@@ -15,7 +15,15 @@ if [ ! -t 0 ] && [ -z "$_WINGS_REEXEC" ]; then
     chmod +x "$_TMPSCRIPT"
     export _WINGS_REEXEC=1
     export _TMPSCRIPT
-    exec bash "$_TMPSCRIPT"
+    # The pipe is used up by now, so every prompt would read EOF and the menu looped forever on
+    # "Invalid choice" (code review 2026-09-29, 02 F12). Answer from the terminal instead.
+    if (exec < /dev/tty) 2>/dev/null; then
+        exec bash "$_TMPSCRIPT" < /dev/tty
+    fi
+    rm -f "$_TMPSCRIPT"
+    echo "This installer is interactive and there is no terminal to read answers from." >&2
+    echo "Run it as: bash <(curl -fsSL <url>)" >&2
+    exit 1
 fi
 
 # Ensure /dev/fd exists (missing on some minimal VPS/containers)
@@ -73,6 +81,59 @@ prompt_with_default() {
         value="$default"
     fi
     printf -v "$var_name" '%s' "$value"
+}
+
+# Like prompt_with_default, but only a whole number is accepted. These values go into the YAML
+# unquoted, so free text broke the file or its types (code review 2026-09-29, 02 F14).
+prompt_int_with_default() {
+    local prompt="$1"
+    local default="$2"
+    local var_name="$3"
+    local value=""
+
+    while true; do
+        echo -en "$prompt [${CYAN}$default${NC}]: "
+        read -r value || { echo; echo -e "${RED}  ✗ No input.${NC}"; exit 1; }
+        [ -z "$value" ] && value="$default"
+        [[ "$value" =~ ^[0-9]+$ ]] && break
+        echo -e "${RED}  ✗ Enter a whole number.${NC}"
+    done
+    printf -v "$var_name" '%s' "$value"
+}
+
+# Secrets are read without echo (code review 2026-09-29, 02 F16).
+prompt_secret_required() {
+    local prompt="$1"
+    local var_name="$2"
+    local value=""
+
+    while [ -z "$value" ]; do
+        echo -en "$prompt"
+        read -rs value
+        echo
+        if [ -z "$value" ]; then
+            echo -e "${RED}  ✗ This field is required.${NC}"
+        fi
+    done
+    printf -v "$var_name" '%s' "$value"
+}
+
+prompt_secret_optional() {
+    local prompt="$1"
+    local var_name="$2"
+    local value=""
+
+    echo -en "$prompt"
+    read -rs value
+    echo
+    printf -v "$var_name" '%s' "$value"
+}
+
+# Escape a value for a double-quoted YAML scalar. Values used to go in raw: a backslash was
+# silently changed and a double quote broke the file (code review 2026-09-29, 02 F14).
+yq_dq() {
+    local v="${1//\\/\\\\}"
+    printf '%s' "${v//\"/\\\"}"
 }
 
 # Function to prompt optional (can be empty)
@@ -251,6 +312,22 @@ stage_local_binary() {
     return 0
 }
 
+# Kopia from its GitHub release, into a private temp dir, checked against the release's
+# checksums.txt. It used a fixed /tmp/kopia.tar.gz as root with no check (02 F16).
+install_kopia_binary() {
+    local ver="$1" arch="$2" dir name
+    dir=$(mktemp -d) || return 1
+    name="kopia-${ver}-linux-${arch}.tar.gz"
+    if curl -fsSL -o "$dir/$name" "https://github.com/kopia/kopia/releases/download/v${ver}/${name}" \
+        && curl -fsSL -o "$dir/checksums.txt" "https://github.com/kopia/kopia/releases/download/v${ver}/checksums.txt" \
+        && (cd "$dir" && grep " ${name}\$" checksums.txt | sha256sum -c --status); then
+        tar -xzf "$dir/$name" -C "$dir" && install -m 0755 "$dir/kopia-${ver}-linux-${arch}/kopia" /usr/local/bin/kopia
+    else
+        echo -e "  ${RED}✗ Kopia download failed or did not match its published checksum; not installed.${NC}"
+    fi
+    rm -rf "$dir"
+}
+
 # --- Systemd Unit ---
 
 # Write (or refresh) the canonical wings systemd unit, then reload systemd.
@@ -259,6 +336,16 @@ stage_local_binary() {
 # (e.g. --skip-license) or an ionice wrapper into ExecStart, which makes a newer
 # binary fail to start. Calling this on every update rewrites those away.
 write_systemd_unit() {
+    # A unit someone edited (LimitNOFILE, Environment=KOPIA_PASSWORD= or BORG_PASSPHRASE=) was
+    # replaced silently; keep a copy and say what it had (code review 2026-09-29, 02 F15).
+    local unit=/etc/systemd/system/wings.service
+    if [ -f "$unit" ] && grep -E '^(Environment|EnvironmentFile|LimitNOFILE)=' "$unit" | grep -qvx 'LimitNOFILE=4096'; then
+        local keep="${unit}.pre-update.$(date +%Y%m%d_%H%M%S)"
+        cp -p "$unit" "$keep"
+        echo -e "  ${YELLOW}! wings.service had custom settings; they are not carried over:${NC}"
+        grep -E '^(Environment|EnvironmentFile|LimitNOFILE)' "$unit" | sed -E 's/(PASSWORD|PASSPHRASE|SECRET|KEY)=.*/\1=<hidden>/' | sed 's/^/      /'
+        echo -e "  ${YELLOW}  Old unit kept at ${keep}. Put custom settings in /etc/systemd/system/wings.service.d/*.conf, which updates never touch.${NC}"
+    fi
     cat > /etc/systemd/system/wings.service <<'EOF'
 [Unit]
 Description=Pterodactyl Wings Daemon (Wings-Dedup)
@@ -401,6 +488,8 @@ reconcile_missing_config_keys() {
     # told up front how many questions are coming (and can skip the lot).
     local -a missing=()
     config_block_has_key '^  backups:' 'transfer_grace_days' || missing+=("transfer_grace_days")
+    config_block_has_key '^  backups:' 'delete_grace_days' || missing+=("delete_grace_days")
+    config_anchor_exists '^    trim:' || missing+=("trim")
     if [ "$backend" = "borg" ] && [ "$storage_mode" = "hybrid" ]; then
         config_block_has_key '^      sync:' 'disable_auto_prune'    || missing+=("disable_auto_prune")
         config_block_has_key '^      sync:' 'remote_retention_days' || missing+=("remote_retention_days")
@@ -408,6 +497,7 @@ reconcile_missing_config_keys() {
     fi
     if [ "$backend" = "kopia" ]; then
         config_block_has_key '^    kopia:' 'deleted_grace_days' || missing+=("deleted_grace_days")
+        config_block_has_key '^    kopia:' 'auto_maintenance_enabled' || missing+=("auto_maintenance")
     fi
 
     if [ ${#missing[@]} -eq 0 ]; then
@@ -445,6 +535,37 @@ reconcile_missing_config_keys() {
                 echo -e "  kept on this node before orphan cleanup may reap them. ${BOLD}0 = never delete.${NC}"
                 prompt_with_default "    Value" "30" val
                 config_insert_after_anchor '^  backups:' "    transfer_grace_days: ${val}"
+                ;;
+            delete_grace_days)
+                echo -e "  ${CYAN}delete_grace_days${NC}, days the REMOTE repository keeps a deleted"
+                echo -e "  server's archives. Local archives still go immediately; this is the"
+                echo -e "  window in which a server deleted by mistake, or by a billing lapse the"
+                echo -e "  customer then settles, can still be restored. ${BOLD}0 = never delete.${NC}"
+                prompt_with_default "    Value" "7" val
+                config_insert_after_anchor '^  backups:' "    delete_grace_days: ${val}"
+                ;;
+            trim)
+                echo -e "  ${CYAN}trim${NC}, a daily chunked filesystem trim so the node can mount its"
+                echo -e "  volumes ${BOLD}nodiscard${NC}. With online discard, one big delete (a restore, a"
+                echo -e "  server delete, a borg compact) stalls every server on the node while the"
+                echo -e "  disk works through the discards. Enable it, then drop ${BOLD}discard${NC} from"
+                echo -e "  /etc/fstab and remount. Off = leave the filesystem as it is."
+                if findmnt -no OPTIONS "${PTERODACTYL_ROOT:-/var/lib/pterodactyl}" 2>/dev/null | grep -qw discard; then
+                    echo -e "  ${YELLOW}This node currently mounts its volumes with online discard.${NC}"
+                fi
+                local tr_enabled tr_sched
+                prompt_with_default "    Enable the daily trim? (yes/no)" "no" tr_enabled
+                case "${tr_enabled,,}" in y|yes|true|1) tr_enabled="true" ;; *) tr_enabled="false" ;; esac
+                prompt_with_default "    Schedule (cron, node local time)" "0 4 * * *" tr_sched
+                config_insert_after_anchor '^  backups:' \
+"    trim:
+      enabled: ${tr_enabled}
+      schedule: \"${tr_sched}\"
+      path: /var/lib/pterodactyl
+      chunk_gib: 64
+      pause_seconds: 2
+      max_io_pressure: 15
+      max_duration_minutes: 120"
                 ;;
             disable_auto_prune)
                 echo -e "  ${CYAN}disable_auto_prune${NC}, set true to stop the nightly remote prune+compact."
@@ -487,6 +608,29 @@ reconcile_missing_config_keys() {
                     config_insert_after_anchor '^    kopia:' \
 "      maintenance:
         deleted_grace_days: ${val}"
+                fi
+                ;;
+            auto_maintenance)
+                echo -e "  ${CYAN}auto_maintenance_enabled${NC}, lets wings switch on kopia's OWN maintenance"
+                echo -e "  schedule for this repository. Without it maintenance only ran after a"
+                echo -e "  night that deleted backups, so a node that never deletes accumulated"
+                echo -e "  index blobs until every kopia command printed a warning that broke"
+                echo -e "  backup listing, restore and prune. ${BOLD}Say yes unless something else maintains it.${NC}"
+                prompt_with_default "    Enable (true/false)" "true" val
+                local qi fi_
+                prompt_with_default "    Quick maintenance interval (index compaction)" "1h" qi
+                prompt_with_default "    Full maintenance interval (blob garbage collection)" "24h" fi_
+                if config_block_has_anchor '^    kopia:' '^      maintenance:'; then
+                    config_insert_in_block '^    kopia:' '^      maintenance:' \
+"        auto_maintenance_enabled: ${val}
+        quick_interval: ${qi}
+        full_interval: ${fi_}"
+                else
+                    config_insert_after_anchor '^    kopia:' \
+"      maintenance:
+        auto_maintenance_enabled: ${val}
+        quick_interval: ${qi}
+        full_interval: ${fi_}"
                 fi
                 ;;
         esac
@@ -550,29 +694,32 @@ migrate_legacy_config() {
 
     # Build new config block
     NEW_REMOTE_CONFIG="      remote:
-        repository: \"${LEGACY_REMOTE_REPO}\"
-        ssh_key: \"${LEGACY_SSH_KEY}\"
+        repository: \"$(yq_dq "${LEGACY_REMOTE_REPO}")\"
+        ssh_key: \"$(yq_dq "${LEGACY_SSH_KEY}")\"
         ssh_port: ${LEGACY_SSH_PORT}
-        borg_path: \"${LEGACY_BORG_PATH}\"
+        borg_path: \"$(yq_dq "${LEGACY_BORG_PATH}")\"
       sync:
         mode: ${LEGACY_SYNC_MODE}
         workers: 1
-        upload_bwlimit: \"${LEGACY_BW_LIMIT}\""
+        upload_bwlimit: \"$(yq_dq "${LEGACY_BW_LIMIT}")\""
 
     # Insert new config after 'encryption:' block in borg section
     # This is a simple approach - append after the borg section header
     if grep -q "^    borg:" "$CONFIG_FILE" 2>/dev/null; then
         # Use a temp file approach for complex sed
-        awk -v new_config="$NEW_REMOTE_CONFIG" '
+        NEW_CONFIG="$NEW_REMOTE_CONFIG" awk '
             /^    borg:/ { in_borg=1 }
             in_borg && /^      encryption:/ { in_encryption=1 }
             in_encryption && /^      [a-z]/ && !/^      encryption/ { 
-                print new_config
+                print ENVIRON["NEW_CONFIG"]
                 in_encryption=0 
             }
             { print }
-            END { if(in_encryption) print new_config }
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            END { if(in_encryption) print ENVIRON["NEW_CONFIG"] }
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && cat "${CONFIG_FILE}.tmp" > "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.tmp"
+        # Written through, not mv'd: a new file got the umask's 0644 and wings never tightens an
+        # existing file, so the license key and secrets stayed world-readable (02 F13).
+        chmod 600 "$CONFIG_FILE"
     fi
 
     # Remove old disaster_recovery section
@@ -889,7 +1036,8 @@ install_wings_dedup() {
 
     if [ -f "$CONFIG_FILE" ]; then
         echo -e "  ${GREEN}✓${NC} Existing config.yml found"
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        CONFIG_BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp -p "$CONFIG_FILE" "$CONFIG_BACKUP_FILE"
         echo -e "  ${GREEN}✓${NC} Backup created"
         
         # Extract existing values to use as defaults
@@ -956,7 +1104,10 @@ install_wings_dedup() {
     echo -e "  ${YELLOW}  Format: alphanumeric with optional hyphens (e.g., abc123-def456)${NC}"
     while true; do
         if [ -n "$OLD_LICENSE_KEY" ]; then
-            prompt_with_default "  License Key" "$OLD_LICENSE_KEY" LICENSE_KEY
+            # Only a prefix of the stored key is shown (02 F16); Enter keeps it.
+            echo -en "  License Key [${CYAN}${OLD_LICENSE_KEY:0:6}... keep current${NC}]: "
+            read -r LICENSE_KEY
+            [ -z "$LICENSE_KEY" ] && LICENSE_KEY="$OLD_LICENSE_KEY"
         else
             prompt_required "  License Key: " LICENSE_KEY
         fi
@@ -1044,7 +1195,7 @@ install_wings_dedup() {
             ssh_key_default="${OLD_SSH_KEY:-/root/.ssh/id_ed25519}"
             borg_path_default="${OLD_REMOTE_BORG_PATH:-borg}"
             
-            prompt_with_default "  SSH Port" "$ssh_port_default" SSH_PORT
+            prompt_int_with_default "  SSH Port" "$ssh_port_default" SSH_PORT
             prompt_with_default "  SSH Key Path" "$ssh_key_default" SSH_KEY
             prompt_with_default "  Remote Borg Path" "$borg_path_default" REMOTE_BORG_PATH
             
@@ -1058,9 +1209,9 @@ install_wings_dedup() {
                 lock_wait_default="${OLD_SYNC_LOCK_WAIT:-300}"
                 
                 prompt_with_default "  Upload Bandwidth Limit" "$bwlimit_default" SYNC_BWLIMIT
-                prompt_with_default "  Sync Batch Delay (seconds)" "$batch_delay_default" SYNC_BATCH_DELAY
-                prompt_with_default "  Sync Timeout (hours)" "$timeout_default" SYNC_TIMEOUT_HOURS
-                prompt_with_default "  Lock Wait (seconds)" "$lock_wait_default" SYNC_LOCK_WAIT
+                prompt_int_with_default "  Sync Batch Delay (seconds)" "$batch_delay_default" SYNC_BATCH_DELAY
+                prompt_int_with_default "  Sync Timeout (hours)" "$timeout_default" SYNC_TIMEOUT_HOURS
+                prompt_int_with_default "  Lock Wait (seconds)" "$lock_wait_default" SYNC_LOCK_WAIT
                 
                 echo ""
                 echo -e "  ${CYAN}── Remote Retention (disaster-recovery repository) ──${NC}"
@@ -1086,16 +1237,16 @@ install_wings_dedup() {
                 if [ "$REMOTE_DISABLE_AUTO_PRUNE" = "false" ]; then
                     echo -e "  ${YELLOW}  Grace period: days a backup stays on the remote after being deleted${NC}"
                     echo -e "  ${YELLOW}  locally (0 = never delete anything, e.g. append-only SSH)${NC}"
-                    prompt_with_default "  Remote grace period (days)" "$retention_days_default" REMOTE_RETENTION_DAYS
+                    prompt_int_with_default "  Remote grace period (days)" "$retention_days_default" REMOTE_RETENTION_DAYS
 
                     echo ""
                     echo -e "  ${YELLOW}  Optional long-term history: keep some archives beyond the grace${NC}"
                     echo -e "  ${YELLOW}  period, per server, after they are gone locally. These can only${NC}"
                     echo -e "  ${YELLOW}  ADD retention; they never shorten the two rules above.${NC}"
                     echo -e "  ${YELLOW}  0 = off (the remote then holds exactly the two rules above).${NC}"
-                    prompt_with_default "  Keep daily" "${OLD_KEEP_DAILY:-0}" REMOTE_KEEP_DAILY
-                    prompt_with_default "  Keep weekly" "${OLD_KEEP_WEEKLY:-0}" REMOTE_KEEP_WEEKLY
-                    prompt_with_default "  Keep monthly" "${OLD_KEEP_MONTHLY:-0}" REMOTE_KEEP_MONTHLY
+                    prompt_int_with_default "  Keep daily" "${OLD_KEEP_DAILY:-0}" REMOTE_KEEP_DAILY
+                    prompt_int_with_default "  Keep weekly" "${OLD_KEEP_WEEKLY:-0}" REMOTE_KEEP_WEEKLY
+                    prompt_int_with_default "  Keep monthly" "${OLD_KEEP_MONTHLY:-0}" REMOTE_KEEP_MONTHLY
                 fi
 
                 echo ""
@@ -1117,13 +1268,13 @@ install_wings_dedup() {
         prompt_with_default "  S3 Region" "us-east-1" S3_REGION
         prompt_required "  S3 Bucket Name: " S3_BUCKET
         prompt_required "  Access Key: " S3_ACCESS_KEY
-        prompt_required "  Secret Key: " S3_SECRET_KEY
+        prompt_secret_required "  Secret Key: " S3_SECRET_KEY
         
         # Encryption password for Kopia
         echo ""
         echo -e "  ${YELLOW}Kopia encrypts all backups. A password is required.${NC}"
         echo -e "  ${YELLOW}Leave blank to auto-generate a secure password.${NC}"
-        prompt_optional "  Encryption Password: " KOPIA_PASSWORD
+        prompt_secret_optional "  Encryption Password: " KOPIA_PASSWORD
         if [ -z "$KOPIA_PASSWORD" ]; then
             KOPIA_PASSWORD=$(openssl rand -base64 32)
             echo "$KOPIA_PASSWORD" > /root/.kopia-password
@@ -1137,7 +1288,7 @@ install_wings_dedup() {
         
         # Local cache for Kopia
         prompt_with_default "  Local Cache Path" "/var/lib/pterodactyl/backups/kopia-cache" KOPIA_CACHE
-        prompt_with_default "  Cache Size (MB)" "5000" KOPIA_CACHE_SIZE
+        prompt_int_with_default "  Cache Size (MB)" "5000" KOPIA_CACHE_SIZE
     fi
     echo ""
     
@@ -1236,18 +1387,12 @@ KOPIAEOF
                 # Arch Linux - install from AUR or binary
                 echo -e "  ${YELLOW}Installing Kopia from binary...${NC}"
                 KOPIA_LATEST=$(curl -s https://api.github.com/repos/kopia/kopia/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-                curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_LATEST}/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}.tar.gz"
-                tar -xzf /tmp/kopia.tar.gz -C /tmp
-                mv /tmp/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}/kopia /usr/local/bin/
-                rm -rf /tmp/kopia* 
+                install_kopia_binary "$KOPIA_LATEST" "$ARCH_NAME"
             else
                 # Fallback: download binary
                 echo -e "  ${YELLOW}Installing Kopia from binary...${NC}"
                 KOPIA_LATEST=$(curl -s https://api.github.com/repos/kopia/kopia/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-                curl -fsSL -o /tmp/kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_LATEST}/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}.tar.gz"
-                tar -xzf /tmp/kopia.tar.gz -C /tmp
-                mv /tmp/kopia-${KOPIA_LATEST}-linux-${ARCH_NAME}/kopia /usr/local/bin/
-                rm -rf /tmp/kopia*
+                install_kopia_binary "$KOPIA_LATEST" "$ARCH_NAME"
             fi
             
             if command -v kopia &> /dev/null; then
@@ -1315,15 +1460,15 @@ EOF
         # Start the borg config block
         BACKUP_CONFIG="
   backups:
-    backend: \"${BACKUP_BACKEND}\"
-    storage_mode: \"${STORAGE_MODE}\"
+    backend: \"$(yq_dq "${BACKUP_BACKEND}")\"
+    storage_mode: \"$(yq_dq "${STORAGE_MODE}")\"
     borg:
       enabled: true"
         
         # Add local_repository if we have one (local and hybrid modes)
         if [ -n "$BORG_REPO" ]; then
             BACKUP_CONFIG+="
-      local_repository: \"${BORG_REPO}\""
+      local_repository: \"$(yq_dq "${BORG_REPO}")\""
         fi
         
         # Add compression and encryption
@@ -1336,10 +1481,10 @@ EOF
         if [ -n "$REMOTE_REPO" ]; then
             BACKUP_CONFIG+="
       remote:
-        repository: \"${REMOTE_REPO}\"
-        ssh_key: \"${SSH_KEY}\"
+        repository: \"$(yq_dq "${REMOTE_REPO}")\"
+        ssh_key: \"$(yq_dq "${SSH_KEY}")\"
         ssh_port: ${SSH_PORT}
-        borg_path: \"${REMOTE_BORG_PATH}\""
+        borg_path: \"$(yq_dq "${REMOTE_BORG_PATH}")\""
             
             # Add sync config for hybrid mode
             if [[ "$STORAGE_MODE" == "hybrid" ]]; then
@@ -1353,14 +1498,14 @@ EOF
         mode: native
         workers: 1
         batch_delay_seconds: ${SYNC_BATCH_DELAY}
-        upload_bwlimit: \"${SYNC_BWLIMIT}\"
+        upload_bwlimit: \"$(yq_dq "${SYNC_BWLIMIT}")\"
         timeout_hours: ${SYNC_TIMEOUT_HOURS}
         lock_wait_seconds: ${SYNC_LOCK_WAIT}"
                 
                 # Add rsync_ssh_key if provided
                 if [ -n "$RSYNC_SSH_KEY" ]; then
                     BACKUP_CONFIG+="
-        rsync_ssh_key: \"${RSYNC_SSH_KEY}\""
+        rsync_ssh_key: \"$(yq_dq "${RSYNC_SSH_KEY}")\""
                 fi
                 
                 REMOTE_DISABLE_AUTO_PRUNE="${REMOTE_DISABLE_AUTO_PRUNE:-false}"
@@ -1394,25 +1539,25 @@ EOF
         # Kopia configuration
         BACKUP_CONFIG="
   backups:
-    backend: \"${BACKUP_BACKEND}\"
-    storage_mode: \"${STORAGE_MODE}\"
+    backend: \"$(yq_dq "${BACKUP_BACKEND}")\"
+    storage_mode: \"$(yq_dq "${STORAGE_MODE}")\"
     kopia:
       enabled: true
       s3:
-        endpoint: \"${S3_ENDPOINT}\"
-        region: \"${S3_REGION}\"
-        bucket: \"${S3_BUCKET}\"
-        access_key: \"${S3_ACCESS_KEY}\"
-        secret_key: \"${S3_SECRET_KEY}\"
+        endpoint: \"$(yq_dq "${S3_ENDPOINT}")\"
+        region: \"$(yq_dq "${S3_REGION}")\"
+        bucket: \"$(yq_dq "${S3_BUCKET}")\"
+        access_key: \"$(yq_dq "${S3_ACCESS_KEY}")\"
+        secret_key: \"$(yq_dq "${S3_SECRET_KEY}")\"
       cache:
         enabled: true
-        path: \"${KOPIA_CACHE}\"
+        path: \"$(yq_dq "${KOPIA_CACHE}")\"
         size_mb: ${KOPIA_CACHE_SIZE}
       performance:
-        upload_bwlimit: \"${KOPIA_BWLIMIT}\"
+        upload_bwlimit: \"$(yq_dq "${KOPIA_BWLIMIT}")\"
       encryption:
         enabled: true
-        password: \"${KOPIA_PASSWORD}\""
+        password: \"$(yq_dq "${KOPIA_PASSWORD}")\""
         
         echo -e "  ${GREEN}✓${NC} Kopia S3 backup configured"
     fi
@@ -1432,7 +1577,7 @@ EOF
     if [ -n "$DISCORD_WEBHOOK" ]; then
         BACKUP_CONFIG+="
     notifications:
-      discord_webhook: \"${DISCORD_WEBHOOK}\""
+      discord_webhook: \"$(yq_dq "${DISCORD_WEBHOOK}")\""
         echo -e "  ${GREEN}✓${NC} Discord webhook configured"
     else
         echo -e "  ${YELLOW}○${NC} Discord webhook skipped"
@@ -1464,11 +1609,11 @@ EOF
     # Insert backup config into system: block
     if grep -q "^system:" "$CONFIG_FILE" 2>/dev/null; then
         # Use awk to find "system:" and insert our config right after it
-        awk -v new_config="$BACKUP_CONFIG" '
+        NEW_CONFIG="$BACKUP_CONFIG" awk '
             /^system:/ { 
                 print $0
                 print "# Wings-Dedup Backup Configuration"
-                print new_config
+                print ENVIRON["NEW_CONFIG"]
                 next
             }
             { print }
@@ -1484,6 +1629,16 @@ EOF
     fi
 
     chmod 600 "$CONFIG_FILE"
+    if ! config_yaml_is_valid; then
+        echo -e "  ${RED}✗ The new config.yml is not valid YAML; the binary was not switched over.${NC}"
+        if [ -n "$CONFIG_BACKUP_FILE" ] && [ -f "$CONFIG_BACKUP_FILE" ]; then
+            cp -f "${CONFIG_FILE}" "${CONFIG_FILE}.invalid.$(date +%Y%m%d_%H%M%S)"
+            cat "$CONFIG_BACKUP_FILE" > "$CONFIG_FILE"
+            chmod 600 "$CONFIG_FILE"
+            echo -e "  ${YELLOW}  Restored the previous config from ${CONFIG_BACKUP_FILE}; the rejected one is kept as ${CONFIG_FILE}.invalid.*${NC}"
+        fi
+        exit 1
+    fi
     echo -e "  ${GREEN}✓${NC} Config saved and permissions secured"
 
     # Create systemd service
