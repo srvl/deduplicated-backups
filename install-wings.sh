@@ -244,6 +244,41 @@ commit_binary() {
     return 0
 }
 
+# Public half of the wings-dedup release signing key.
+RELEASE_SIGNING_KEY="MCowBQYDK2VwAyEAcYOx6w0nkACY3epfP/mqJFiAvyKhpXeR2Dkosi/ftmY="
+
+# Check <binary>.sig from the release. 0 = verified, or not checkable here (said so);
+# 1 = the signature is present and WRONG, or missing while REQUIRE_SIGNATURE=1.
+verify_release_signature() {
+    local bin="$1" url="$2" dir
+    dir=$(mktemp -d) || return 1
+    if ! curl -f -s -L -o "$dir/sig" "$url" 2>/dev/null; then
+        rm -rf "$dir"
+        if [ "${REQUIRE_SIGNATURE:-0}" = "1" ]; then
+            echo -e "  ${RED}✗ This release has no signature and REQUIRE_SIGNATURE=1${NC}"
+            return 1
+        fi
+        echo -e "  ${YELLOW}○${NC} This release has no signature (older release); checksum only"
+        return 0
+    fi
+    if ! openssl version 2>/dev/null | grep -qE '^OpenSSL ([3-9]|[1-9][0-9])\.'; then
+        rm -rf "$dir"
+        echo -e "  ${YELLOW}○${NC} OpenSSL 3 not found, signature not checked (checksum verified)"
+        return 0
+    fi
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$RELEASE_SIGNING_KEY" > "$dir/pub.pem"
+    openssl dgst -sha256 -binary "$bin" > "$dir/digest"
+    if base64 -d "$dir/sig" > "$dir/sig.bin" 2>/dev/null \
+        && openssl pkeyutl -verify -pubin -inkey "$dir/pub.pem" -rawin -in "$dir/digest" -sigfile "$dir/sig.bin" >/dev/null 2>&1; then
+        rm -rf "$dir"
+        echo -e "  ${GREEN}✓${NC} Release signature verified"
+        return 0
+    fi
+    rm -rf "$dir"
+    echo -e "  ${RED}✗ The release signature does NOT match this binary; refusing to install it${NC}"
+    return 1
+}
+
 # Stage a binary shipped alongside this script, so an install/update uses what the
 # operator actually put on the box instead of silently pulling a different build
 # from GitHub. Only if nothing is found locally do the callers fall back to a
@@ -966,6 +1001,15 @@ install_wings_dedup() {
                 # Every release ships one; a missing file means a broken or tampered download (02 F9).
                 echo -e "  ${RED}✗ No checksum file for this download, refusing to install it unverified${NC}"
                 echo -e "  ${YELLOW}  Re-run with SKIP_CHECKSUM=1 only if you know why it is missing.${NC}"
+                rm -f wings
+                exit 1
+            fi
+
+            # Signature (02 F9): releases carry <binary>.sig, an Ed25519 signature over the
+            # binary's SHA-256 made with a key that never leaves the build box. Checked when
+            # OpenSSL 3 is present (older OpenSSL cannot verify Ed25519 from the shell).
+            LAST_STEP="verifying signature"
+            if ! verify_release_signature ./wings "${DOWNLOAD_URL}.sig"; then
                 rm -f wings
                 exit 1
             fi
@@ -1862,6 +1906,15 @@ update_only() {
                 # Every release ships one; a missing file means a broken or tampered download (02 F9).
                 echo -e "  ${RED}✗ No checksum file for this download, refusing to install it unverified${NC}"
                 echo -e "  ${YELLOW}  Re-run with SKIP_CHECKSUM=1 only if you know why it is missing.${NC}"
+                rm -f wings
+                exit 1
+            fi
+
+            # Signature (02 F9): releases carry <binary>.sig, an Ed25519 signature over the
+            # binary's SHA-256 made with a key that never leaves the build box. Checked when
+            # OpenSSL 3 is present (older OpenSSL cannot verify Ed25519 from the shell).
+            LAST_STEP="verifying signature"
+            if ! verify_release_signature ./wings "${DOWNLOAD_URL}.sig"; then
                 rm -f wings
                 exit 1
             fi
