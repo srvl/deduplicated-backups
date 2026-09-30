@@ -4,8 +4,6 @@
 > and kopia `auto_maintenance_enabled` need a newer build than this repository's public release;
 > an older binary ignores keys it does not know.
 
-<!-- doc build %%__NONCE_WINGS_1__%% -->
-
 ---
 
 ## Table of Contents
