@@ -138,8 +138,47 @@ validate_binary() {
     if ! "$binary" version >/dev/null 2>&1; then
         echo -e "  ${YELLOW}! Binary is valid ELF but execution test failed${NC}"
         echo -e "  ${YELLOW}  This may be normal if run from a restricted directory.${NC}"
-        echo -e "  ${YELLOW}  Proceeding with installation...${NC}"
+        echo -e "  ${YELLOW}  It is tested again from ${WINGS_BINARY%/*} before anything is replaced.${NC}"
         return 0
+    fi
+    return 0
+}
+
+# Copy ./wings next to the installed binary and prove it runs there, before the service is
+# touched. The old path stopped wings, then cp'd over it unchecked: a failed copy (text file busy,
+# disk full), a binary that does not run, or running from /usr/local/bin itself (where ./wings IS
+# the live binary and was then deleted) all ended with the node down and "installed" printed
+# (code review 2026-09-29, report 02 F6).
+stage_binary() {
+    WINGS_STAGED="${WINGS_BINARY}.new"
+    if [ -e "$WINGS_BINARY" ] && [ ./wings -ef "$WINGS_BINARY" ]; then
+        echo -e "  ${RED}✗ ./wings is the installed binary itself. Run the installer from another directory.${NC}"
+        return 1
+    fi
+    rm -f "$WINGS_STAGED"
+    if ! cp ./wings "$WINGS_STAGED" || ! chmod 755 "$WINGS_STAGED" || ! cmp -s ./wings "$WINGS_STAGED"; then
+        rm -f "$WINGS_STAGED"
+        echo -e "  ${RED}✗ Could not copy the new binary to ${WINGS_STAGED} (disk full?)${NC}"
+        return 1
+    fi
+    if ! "$WINGS_STAGED" version >/dev/null 2>&1; then
+        rm -f "$WINGS_STAGED"
+        echo -e "  ${RED}✗ The new binary does not run on this machine (wrong architecture or a corrupt download)${NC}"
+        return 1
+    fi
+    rm -f ./wings
+    return 0
+}
+
+# Swap the staged binary in by rename (atomic, and fine while the old one runs), keeping the
+# previous build as wings.prev for a manual rollback.
+commit_binary() {
+    if [ -f "$WINGS_BINARY" ]; then
+        cp -p "$WINGS_BINARY" "${WINGS_BINARY}.prev" 2>/dev/null || true
+    fi
+    if ! mv -f "$WINGS_STAGED" "$WINGS_BINARY"; then
+        echo -e "  ${RED}✗ Could not move ${WINGS_STAGED} into place; the previous binary is unchanged${NC}"
+        return 1
     fi
     return 0
 }
@@ -295,6 +334,41 @@ config_insert_after_anchor() {
     rm -f "$tmp"
 }
 
+# config_block_has_anchor <parent_anchor_regex> <child_anchor_regex>
+# True when a line matching <child> sits inside the block opened by <parent>.
+config_block_has_anchor() {
+    awk -v parent="$1" -v child="$2" '
+        {
+            match($0, /^ */); indent = RLENGTH
+            if (inblock && $0 ~ /[^[:space:]]/ && indent <= parent_indent) { inblock = 0 }
+            if (inblock && $0 ~ child) { found = 1; exit }
+            if (!inblock && $0 ~ parent) { inblock = 1; parent_indent = indent }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$CONFIG_FILE"
+}
+
+# config_insert_in_block <parent_anchor_regex> <child_anchor_regex> <text>
+# Inserts <text> after the first <child> line INSIDE the <parent> block. The
+# config holds borg.maintenance before kopia.maintenance, both at the same
+# indent, so a file-wide first match wrote kopia's keys under borg (code
+# review 2026-09-29, report 02 F7).
+config_insert_in_block() {
+    local parent="$1" child="$2" text="$3" tmp
+    tmp="$(mktemp)"
+    awk -v parent="$parent" -v child="$child" -v text="$text" '
+        {
+            match($0, /^ */); indent = RLENGTH
+            if (inblock && $0 ~ /[^[:space:]]/ && indent <= parent_indent) { inblock = 0 }
+            print
+            if (!done && inblock && $0 ~ child) { print text; done = 1 }
+            if (!done && !inblock && $0 ~ parent) { inblock = 1; parent_indent = indent }
+        }
+    ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$CONFIG_FILE"
+    rm -f "$tmp"
+}
+
 # config_yaml_is_valid, best effort. Returns success when we cannot check, so a
 # box without python3 is not blocked from updating.
 config_yaml_is_valid() {
@@ -407,8 +481,8 @@ reconcile_missing_config_keys() {
                 echo -e "  ${CYAN}deleted_grace_days${NC}, days a deleted backup stays RECOVERABLE before its"
                 echo -e "  kopia snapshot is really removed and its space reclaimed. ${BOLD}0 = immediate.${NC}"
                 prompt_with_default "    Value" "7" val
-                if config_anchor_exists '^      maintenance:'; then
-                    config_insert_after_anchor '^      maintenance:' "        deleted_grace_days: ${val}"
+                if config_block_has_anchor '^    kopia:' '^      maintenance:'; then
+                    config_insert_in_block '^    kopia:' '^      maintenance:' "        deleted_grace_days: ${val}"
                 else
                     config_insert_after_anchor '^    kopia:' \
 "      maintenance:
@@ -710,15 +784,16 @@ install_wings_dedup() {
         # Fetch latest release tag from GitHub API
         LATEST_TAG=$(curl -s https://api.github.com/repos/srvl/deduplicated-backups/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$LATEST_TAG" ]; then
-            echo -e "  ${RED}✗ Failed to fetch latest release tag${NC}"
-            echo -e "  ${YELLOW}  Falling back to v2.2...${NC}"
-            LATEST_TAG="v2.2"
+            # The API is rate-limited (60/h per IP, often shared behind NAT). The old fallback was a
+            # tag that has no release, so this path always failed (code review 2026-09-29, 02 F9).
+            echo -e "  ${YELLOW}○${NC} GitHub API unavailable; using the latest release download link"
+            DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/latest/download/${BINARY_NAME}"
+            CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/latest/download/${BINARY_NAME}.sha256"
         else
             echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
+            DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
+            CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
         fi
-        
-        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
-        CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
             echo -e "  ${GREEN}✓${NC} Download complete (${BINARY_NAME})"
@@ -738,8 +813,14 @@ install_wings_dedup() {
                 fi
                 echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
                 rm -f wings.sha256
+            elif [ "${SKIP_CHECKSUM:-0}" = "1" ]; then
+                echo -e "  ${YELLOW}○${NC} No checksum file; SKIP_CHECKSUM=1 so continuing unverified"
             else
-                echo -e "  ${YELLOW}○${NC} No checksum file available, skipping verification"
+                # Every release ships one; a missing file means a broken or tampered download (02 F9).
+                echo -e "  ${RED}✗ No checksum file for this download, refusing to install it unverified${NC}"
+                echo -e "  ${YELLOW}  Re-run with SKIP_CHECKSUM=1 only if you know why it is missing.${NC}"
+                rm -f wings
+                exit 1
             fi
         else
             echo -e "  ${RED}✗ Failed to download wings binary!${NC}"
@@ -760,28 +841,26 @@ install_wings_dedup() {
     guard_downgrade || exit 1
     echo ""
 
-    # Step 2: Stop Service and Install Binary
+    # Step 2: Stage the binary. Wings keeps running on the old one through every question below
+    # and is only switched over at the very end: an abort at any prompt used to leave the node down
+    # (code review 2026-09-29, report 02 F5).
     LAST_STEP="installing binary"
     echo -e "${BLUE}${BOLD}[Step 2/5] Installing Wings-Dedup binary...${NC}"
 
-    if systemctl is-active --quiet wings 2>/dev/null; then
-        echo -e "  ${YELLOW}Stopping Wings service...${NC}"
-        systemctl stop wings
-        echo -e "  ${GREEN}✓${NC} Service stopped"
-    fi
-    
+    stage_binary || exit 1
+
     # Backup old binary
     if [ -f "$WINGS_BINARY" ] && [ ! -f "$BACKUP_BINARY_PATH" ]; then
-        cp "$WINGS_BINARY" "$BACKUP_BINARY_PATH"
+        if ! cp "$WINGS_BINARY" "$BACKUP_BINARY_PATH"; then
+            echo -e "  ${RED}✗ Could not back up the current Wings to ${BACKUP_BINARY_PATH}${NC}"
+            exit 1
+        fi
         echo -e "  ${GREEN}✓${NC} Original Wings backed up to ${CYAN}${BACKUP_BINARY_PATH}${NC}"
     elif [ -f "$WINGS_BINARY" ] && [ -f "$BACKUP_BINARY_PATH" ]; then
         echo -e "  ${GREEN}✓${NC} Backup already exists, skipping"
     fi
 
-    cp wings "$WINGS_BINARY"
-    chmod +x "$WINGS_BINARY"
-    rm -f wings
-    echo -e "  ${GREEN}✓${NC} Wings-Dedup installed to ${CYAN}${WINGS_BINARY}${NC}"
+    echo -e "  ${GREEN}✓${NC} Wings-Dedup staged at ${CYAN}${WINGS_STAGED}${NC} (Wings keeps running until the last step)"
 
     mkdir -p /etc/pterodactyl /var/lib/pterodactyl/{volumes,backups,archives} /var/log/pterodactyl /run/wings
     echo -e "  ${GREEN}✓${NC} Directories created"
@@ -845,8 +924,8 @@ install_wings_dedup() {
         fi
 
         # Replace 'wings' with full path
-        AUTODEPLOY_CMD=$(echo "$AUTODEPLOY_CMD" | sed "s|wings configure|$WINGS_BINARY configure|g")
-        AUTODEPLOY_CMD=$(echo "$AUTODEPLOY_CMD" | sed "s|sudo wings|sudo $WINGS_BINARY|g")
+        AUTODEPLOY_CMD=$(echo "$AUTODEPLOY_CMD" | sed "s|wings configure|$WINGS_STAGED configure|g")
+        AUTODEPLOY_CMD=$(echo "$AUTODEPLOY_CMD" | sed "s|sudo wings|sudo $WINGS_STAGED|g")
 
         echo ""
         echo -e "  ${YELLOW}Running configuration command...${NC}"
@@ -1097,7 +1176,24 @@ install_wings_dedup() {
             else
                 echo -e "  ${RED}✗ Unknown package manager. Install BorgBackup manually.${NC}"; exit 1;
             fi
-            echo -e "  ${GREEN}✓${NC} BorgBackup installed"
+            # The package manager's output is hidden, so check the result rather than assume it
+            # (a held dpkg lock on a fresh VPS is common): code review 2026-09-29, report 02 F8.
+            if ! command -v borg &> /dev/null; then
+                echo -e "  ${RED}✗ BorgBackup did not install (package manager busy or no package?).${NC}"
+                echo -e "  ${YELLOW}  Install borg 1.2 or newer by hand, then run this installer again.${NC}"
+                exit 1
+            fi
+            echo -e "  ${GREEN}✓${NC} BorgBackup installed: ${CYAN}$(borg --version 2>/dev/null | head -1)${NC}"
+        fi
+        # wings-dedup needs borg compact and import-tar (native DR sync), both borg 1.2+; borg 2
+        # is a different repository format. Older distro packages (Ubuntu 20.04, Debian 11) ship 1.1.
+        BORG_V=$(borg --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        if [ -z "$BORG_V" ] || [ "$(printf '%s\n%s\n' "$BORG_V" 1.2.0 | sort -V | head -1)" != "1.2.0" ] \
+            || [ "$(printf '%s\n%s\n' "$BORG_V" 2.0.0 | sort -V | head -1)" = "2.0.0" ]; then
+            echo -e "  ${RED}✗ BorgBackup ${BORG_V:-unknown} is not supported: wings-dedup needs borg 1.2.x or 1.4.x.${NC}"
+            echo -e "  ${YELLOW}  Use the standalone borg binary from https://github.com/borgbackup/borg/releases (1.4.x),${NC}"
+            echo -e "  ${YELLOW}  installed as /usr/local/bin/borg, then run this installer again.${NC}"
+            exit 1
         fi
     else
         # Install Kopia
@@ -1396,6 +1492,11 @@ EOF
     echo -e "  ${GREEN}✓${NC} Systemd service configured"
     echo ""
 
+    # Switch the binary over now that every answer is in.
+    LAST_STEP="installing the new binary"
+    commit_binary || exit 1
+    echo -e "  ${GREEN}✓${NC} Wings-Dedup installed to ${CYAN}${WINGS_BINARY}${NC}"
+
     # Start Wings
     read -p "Start Wings now? [Y/n] " -n 1 -r
     echo
@@ -1403,16 +1504,22 @@ EOF
         echo ""
         # Migrate legacy config if this was an upgrade
         migrate_legacy_config
-        systemctl start wings
+        systemctl restart wings
         sleep 3
         if systemctl is-active --quiet wings; then
             echo -e "${GREEN}✓ Wings-Dedup is running!${NC}"
         else
             echo -e "${RED}✗ Wings failed to start${NC}"
-            echo -e "${YELLOW}Check logs: journalctl -u wings -f${NC}"
+            echo -e "${YELLOW}Check logs: journalctl -u wings -n 50 --no-pager${NC}"
+            [ -f "${WINGS_BINARY}.prev" ] && echo -e "${YELLOW}Previous binary: ${CYAN}mv ${WINGS_BINARY}.prev ${WINGS_BINARY} && systemctl start wings${NC}"
         fi
     else
         echo ""
+        # The old process was left running through setup; stop it so nothing runs half-configured.
+        if systemctl is-active --quiet wings 2>/dev/null; then
+            systemctl stop wings
+            echo -e "${YELLOW}Wings stopped (it was still running the previous version).${NC}"
+        fi
         echo -e "${YELLOW}Start later: ${CYAN}systemctl start wings${NC}"
     fi
 
@@ -1468,10 +1575,27 @@ uninstall_wings_dedup() {
     LAST_STEP="cleaning up configuration"
     echo -e "${BLUE}${BOLD}[3/3] Cleaning up configuration...${NC}"
     if [ -f "$CONFIG_FILE" ]; then
-        # Remove Wings-Dedup specific sections
-        sed -i '/# Wings-Dedup License/,/license_key:/d' "$CONFIG_FILE" 2>/dev/null || true
-        sed -i '/# Wings-Dedup Backup Configuration/,/^[a-z]/d' "$CONFIG_FILE" 2>/dev/null || true
-        echo -e "  ${GREEN}✓${NC} Wings-Dedup settings removed"
+        # Remove exactly the blocks the installer wrote: the top-level license block and the
+        # system.backups block under our marker. The old range delete ran from the marker to the
+        # next top-level key, taking every system.* key after it and the docker: header with it
+        # (code review 2026-09-29, report 02 F4). Keep a copy first either way.
+        CONFIG_KEEP="${CONFIG_FILE}.pre-uninstall-$(date +%Y%m%d%H%M%S)"
+        cp -p "$CONFIG_FILE" "$CONFIG_KEEP"
+        awk '
+            /^# Wings-Dedup License$/ { next }
+            /^license:/ { in_lic = 1; next }
+            in_lic && /^[^ \t#]/ { in_lic = 0 }
+            in_lic { next }
+            /^# Wings-Dedup Backup Configuration$/ { want_b = 1; next }
+            want_b && !in_b && /^[ \t]*$/ { next }
+            want_b && !in_b && /^  backups:/ { in_b = 1; next }
+            in_b && (/^   / || /^[ \t]*$/) { next }
+            in_b { in_b = 0; want_b = 0 }
+            want_b && !in_b { want_b = 0 }
+            { print }
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo -e "  ${GREEN}✓${NC} Wings-Dedup settings removed (previous config kept as ${CYAN}${CONFIG_KEEP}${NC})"
         echo -e "  ${YELLOW}Note: Borg/Kopia repository data was NOT deleted${NC}"
     fi
 
@@ -1548,19 +1672,16 @@ update_only() {
         LATEST_TAG=$(echo "$API_RESPONSE" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         
         if [ -z "$LATEST_TAG" ]; then
-            echo -e "  ${RED}✗ Failed to fetch latest release${NC}"
-            # Show error details for debugging
+            # Rate-limited or down: GitHub's latest-release link needs no API call (02 F9).
             API_MESSAGE=$(echo "$API_RESPONSE" | grep '"message":' | sed -E 's/.*"message": *"([^"]+)".*/\1/')
-            if [ -n "$API_MESSAGE" ]; then
-                echo -e "  ${YELLOW}  GitHub API: ${API_MESSAGE}${NC}"
-            fi
-            echo -e "  ${YELLOW}  API URL: ${API_URL}${NC}"
-            exit 1
+            echo -e "  ${YELLOW}○${NC} GitHub API unavailable${API_MESSAGE:+ (${API_MESSAGE})}; using the latest release download link"
+            DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/latest/download/${BINARY_NAME}"
+            CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/latest/download/${BINARY_NAME}.sha256"
+        else
+            echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
+            DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
+            CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
         fi
-        echo -e "  ${GREEN}✓${NC} Latest release: ${CYAN}${LATEST_TAG}${NC}"
-        
-        DOWNLOAD_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}"
-        CHECKSUM_URL="https://github.com/srvl/deduplicated-backups/releases/download/${LATEST_TAG}/${BINARY_NAME}.sha256"
         
         if curl -f -L -o wings "$DOWNLOAD_URL"; then
             echo -e "  ${GREEN}✓${NC} Download complete"
@@ -1580,8 +1701,14 @@ update_only() {
                 fi
                 echo -e "  ${GREEN}✓${NC} SHA256 checksum verified"
                 rm -f wings.sha256
+            elif [ "${SKIP_CHECKSUM:-0}" = "1" ]; then
+                echo -e "  ${YELLOW}○${NC} No checksum file; SKIP_CHECKSUM=1 so continuing unverified"
             else
-                echo -e "  ${YELLOW}○${NC} No checksum file available, skipping verification"
+                # Every release ships one; a missing file means a broken or tampered download (02 F9).
+                echo -e "  ${RED}✗ No checksum file for this download, refusing to install it unverified${NC}"
+                echo -e "  ${YELLOW}  Re-run with SKIP_CHECKSUM=1 only if you know why it is missing.${NC}"
+                rm -f wings
+                exit 1
             fi
             
             # Validate binary
@@ -1604,22 +1731,16 @@ update_only() {
     # Step 3: Replace binary and restart
     LAST_STEP="installing and restarting"
     echo -e "${BLUE}${BOLD}[Step 3/3] Installing and restarting...${NC}"
-    
-    if systemctl is-active --quiet wings 2>/dev/null; then
-        echo -e "  ${YELLOW}Stopping Wings...${NC}"
-        systemctl stop wings
-    fi
-    
+
+    # Staged and test-run before the service is touched, and every question below is asked while
+    # the old build still runs: wings is stopped only for the swap itself (02 F5/F6).
+    stage_binary || exit 1
+
     # Backup current if not already backed up
     if [ -f "$WINGS_BINARY" ] && [ ! -f "$BACKUP_BINARY_PATH" ]; then
         cp "$WINGS_BINARY" "$BACKUP_BINARY_PATH"
         echo -e "  ${GREEN}✓${NC} Original backed up"
     fi
-    
-    cp wings "$WINGS_BINARY"
-    chmod +x "$WINGS_BINARY"
-    rm -f wings
-    echo -e "  ${GREEN}✓${NC} Binary replaced"
 
     # Refresh the systemd unit so updates self-heal stale units written by older
     # installers (e.g. ones that passed the now-removed --skip-license flag, which
@@ -1635,16 +1756,29 @@ update_only() {
     LAST_STEP="reconciling config keys"
     reconcile_missing_config_keys
 
+    LAST_STEP="installing and restarting"
+    if systemctl is-active --quiet wings 2>/dev/null; then
+        echo -e "  ${YELLOW}Stopping Wings...${NC}"
+        systemctl stop wings
+    fi
+
+    if ! commit_binary; then
+        systemctl start wings 2>/dev/null || true
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Binary replaced (previous build kept as ${CYAN}${WINGS_BINARY}.prev${NC})"
+
     systemctl start wings
     sleep 2
-    
+
     if systemctl is-active --quiet wings; then
         echo -e "  ${GREEN}✓${NC} Wings-Dedup is running!"
     else
         echo -e "  ${RED}✗ Wings failed to start${NC}"
-        echo -e "  ${YELLOW}Check logs: journalctl -u wings -f${NC}"
+        echo -e "  ${YELLOW}Check logs: journalctl -u wings -n 50 --no-pager${NC}"
+        echo -e "  ${YELLOW}Previous build: ${CYAN}mv ${WINGS_BINARY}.prev ${WINGS_BINARY} && systemctl start wings${NC}"
     fi
-    
+
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${GREEN}✓ Update Complete!${NC}"
